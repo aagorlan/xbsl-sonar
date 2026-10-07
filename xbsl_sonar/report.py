@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from xbsl_sonar.rules import RULES
@@ -24,6 +24,10 @@ class Finding:
     message: str
     debt: str | None = None  # пункт долга из пометки исключения
     reason: str | None = None
+
+
+# Ключ репозитория универсальных правил плагина 1С (UniversalReporter.repositoryKey).
+SOURCE = "universal-rules"
 
 
 def sonar_key(rule: str) -> str:
@@ -62,7 +66,9 @@ def bsl_report(findings: list[Finding], root: Path) -> dict:
     """Отчёт в формате BSL Language Server: его принимает `sonar.bsl.languageserver.reportPaths`.
 
     Строки и позиции — с нуля, как в LSP. Путь — абсолютный: плагин ищет файл анализа
-    по абсолютному пути. Находка под пометкой исключения уходит с понижением до подсказки
+    по абсолютному пути. `source` — ключ репозитория правил (`universal-rules`): по нему
+    плагин находит настройки находки, иное значение уводит её к правилам BSL LS. Дата —
+    `yyyy-MM-dd HH:mm:ss`, как в образцах плагина: другой формат роняет разбор отчёта. Находка под пометкой исключения уходит с понижением до подсказки
     и с номером долга в тексте — в SonarQube она видна, но не за ней следят.
     """
     by_file: dict[str, list[dict]] = {}
@@ -78,11 +84,11 @@ def bsl_report(findings: list[Finding], root: Path) -> dict:
                       "end": {"line": f.line - 1, "character": end}},
             "severity": "Warning" if f.debt is None else "Hint",
             "code": sonar_key(f.rule),
-            "source": "universal",
+            "source": SOURCE,
             "message": message,
         })
     return {
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "fileinfos": [{"path": p, "diagnostics": d} for p, d in sorted(by_file.items())],
     }
 

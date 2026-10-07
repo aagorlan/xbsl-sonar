@@ -1,0 +1,48 @@
+# Выпуск: новая версия в xbsl_sonar/__init__.py на main — метка v<версия> и выпуск на странице
+# Releases. Метку ставит этот процесс токеном GitHub: проект ссылается на метку (uses: …@v<версия>),
+# и ставить её руками не нужно. Готовый выпуск не трогается — новая версия, новая метка.
+name: Выпуск
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'xbsl_sonar/__init__.py'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Проверить тестами
+        run: |
+          pip install --quiet -e '.[dev]'
+          python -m pytest -q
+      - name: Прочитать версию
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' xbsl_sonar/__init__.py)"
+          if [ -z "$version" ]; then
+            echo 'В xbsl_sonar/__init__.py нет __version__'; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Опубликовать
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${VERSION}" > /dev/null 2>&1; then
+            echo "Выпуск v${VERSION} уже есть — новая версия начинается с подъёма __version__"
+            exit 0
+          fi
+          gh release create "v${VERSION}" \
+            --target "$GITHUB_SHA" \
+            --title "xbsl-sonar ${VERSION}" \
+            --notes "Установка: pip install \"xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@v${VERSION}\". Проверки и порядок запуска — в README."

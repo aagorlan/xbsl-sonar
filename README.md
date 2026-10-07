@@ -32,7 +32,7 @@
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install "xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@v0.1.0"
+.venv/bin/pip install "xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@v0.1.1"
 
 .venv/bin/xbsl-sonar check <каталог проекта> --help-dir <выгрузка справки> \
     --json находки.json
@@ -80,9 +80,9 @@ on:
   workflow_dispatch:
 jobs:
   analysis:
-    uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.1.0
+    uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.1.1
     with:
-      version: v0.1.0
+      version: v0.1.1
       paths: src
       help-dir: docs/vendor
       sonar-url: ${{ vars.SONAR_URL }}      # пусто — без SonarQube
@@ -124,7 +124,7 @@ sonar-scanner \
 
 - `languageserver.enabled=false` — встроенный анализатор BSL выключен: он рассчитан
   на язык 1С:Предприятия 8 и XBSL не разбирает;
-- отчёт `--bsl-report` — в формате BSL Language Server, находки в нём с `source: universal`
+- отчёт `--bsl-report` — в формате BSL Language Server, находки в нём с `source: universal-rules`
   и кодом правила `PR-NN` (латиницей — ключ правила на сервере);
 - `universal.createExternalIssues=true` — находка правила, которого сервер ещё не знает
   (описания не обновлены), всё равно появится как внешняя.

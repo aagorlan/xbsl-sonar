@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import textwrap
 from pathlib import Path
 
@@ -163,7 +164,8 @@ def test_exception_mark_above_the_line(tmp_path, monkeypatch, data_dir):
     assert [(f["debt"], f["reason"]) for f in found] == [("ТД-7", "разовая обработка десятка записей")]
     bsl = json.loads((tmp_path / "отчёт.json").read_text(encoding="utf-8"))
     diag = bsl["fileinfos"][0]["diagnostics"][0]
-    assert diag["severity"] == "Hint" and diag["code"] == "PR-15" and diag["source"] == "universal"
+    assert diag["severity"] == "Hint" and diag["code"] == "PR-15" and diag["source"] == "universal-rules"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", bsl["date"])
 
 
 def test_mark_for_another_rule_does_not_apply(tmp_path, monkeypatch, data_dir):

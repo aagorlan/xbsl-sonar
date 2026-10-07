@@ -1,0 +1,140 @@
+# Многоразовый процесс анализа: вызывается из репозитория проекта XBSL.
+#
+#   jobs:
+#     analysis:
+#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.1.0
+#       with:
+#         version: v0.1.0
+#         sonar-url: ${{ vars.SONAR_URL }}
+#       secrets:
+#         sonar-token: ${{ secrets.SONAR_TOKEN }}
+#
+# Без sonar-url анализ идёт без SonarQube: находки — в журнале и в сводке запуска.
+# Процесс краснеет, если есть находка без пометки исключения; отчёт в SonarQube при этом
+# всё равно отправляется — чтобы находку было где посмотреть.
+name: Анализ XBSL
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Версия xbsl-sonar (метка), та же, что в uses'
+        type: string
+        required: true
+      paths:
+        description: 'Что проверять, через пробел'
+        type: string
+        default: 'IT'
+      help-dir:
+        description: 'Выгрузка справки 1С:Элемент (каталог с topics/)'
+        type: string
+        default: 'docs/vendor'
+      sonar-url:
+        description: 'Адрес SonarQube; пусто — без SonarQube'
+        type: string
+        default: ''
+      scanner-version:
+        description: 'Версия sonar-scanner CLI'
+        type: string
+        default: '8.1.0.6389'
+      runs-on:
+        description: 'Исполнитель'
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      sonar-token:
+        required: false
+
+jobs:
+  analysis:
+    name: Анализ
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Анализу веток SonarQube нужна история, чтобы отличать новый код.
+          fetch-depth: 0
+
+      - name: Поставить xbsl-sonar
+        shell: bash
+        run: |
+          set -eu
+          python3 -m venv "$RUNNER_TEMP/xbsl-sonar"
+          "$RUNNER_TEMP/xbsl-sonar/bin/pip" install --quiet \
+            "xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@${{ inputs.version }}"
+          "$RUNNER_TEMP/xbsl-sonar/bin/xbsl-sonar" --version
+
+      - name: Проверить код
+        id: check
+        shell: bash
+        run: |
+          set -u
+          mkdir -p .xbsl-sonar
+          rc=0
+          "$RUNNER_TEMP/xbsl-sonar/bin/xbsl-sonar" check ${{ inputs.paths }} \
+            --help-dir "${{ inputs.help-dir }}" \
+            --json .xbsl-sonar/findings.json \
+            --bsl-report .xbsl-sonar/bsl-report.json || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open('.xbsl-sonar/findings.json', encoding='utf-8'))
+          f = d['findings']
+          print(f"### Анализ XBSL: {', '.join(d['rules'])}\n")
+          if not f:
+              print('Находок нет.')
+          else:
+              print('| Правило | Файл | Строка | Исключение | Сообщение |')
+              print('|---|---|---|---|---|')
+              for x in f:
+                  print(f"| {x['rule']} | `{x['path']}` | {x['line']} | {x['debt'] or '—'} | {x['message']} |")
+          PY
+          [ "$rc" -le 1 ] || exit "$rc"
+
+      - name: Отправить в SonarQube
+        if: inputs.sonar-url != ''
+        shell: bash
+        env:
+          SONAR_TOKEN: ${{ secrets.sonar-token }}
+          SONAR_URL: ${{ inputs.sonar-url }}
+          SCANNER: ${{ inputs.scanner-version }}
+          # Имена веток — через окружение, не подстановкой в текст скрипта: имя ветки PR
+          # выбирает его автор.
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo 'Не передан секрет sonar-token' | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/sonar-scanner-$SCANNER-linux-x64"
+          if [ ! -x "$dir/bin/sonar-scanner" ]; then
+            curl -sSfL -o "$RUNNER_TEMP/scanner.zip" \
+              "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-$SCANNER-linux-x64.zip"
+            unzip -q -o "$RUNNER_TEMP/scanner.zip" -d "$RUNNER_TEMP"
+          fi
+          if [ "$EVENT" = "pull_request" ]; then
+            branch_args=(-Dsonar.pullrequest.key="$PR_NUMBER" -Dsonar.pullrequest.branch="$HEAD_REF"
+                         -Dsonar.pullrequest.base="$BASE_REF")
+          else
+            branch_args=(-Dsonar.branch.name="$REF_NAME")
+          fi
+          "$dir/bin/sonar-scanner" \
+            -Dsonar.host.url="$SONAR_URL" \
+            -Dsonar.bsl.languageserver.enabled=false \
+            -Dsonar.bsl.languageserver.reportPaths=.xbsl-sonar/bsl-report.json \
+            -Dsonar.bsl.universal.createExternalIssues=true \
+            "${branch_args[@]}"
+          echo "SonarQube: $SONAR_URL" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Итог
+        if: steps.check.outputs.rc != '0'
+        shell: bash
+        run: |
+          echo 'Есть находки без пометки исключения — см. сводку запуска'
+          exit 1

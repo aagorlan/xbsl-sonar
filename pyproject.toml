@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xbsl-sonar"
+dynamic = ["version"]
+description = "Проверки безопасности и производительности кода XBSL (1С:Элемент) для SonarQube и без него"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    # Движок разбора XBSL, закреплённый коммитом (метка vscode-v1.0.0, пакет 1.0.0).
+    "xbsl @ git+https://github.com/keyfire/xbsl@2f78591ae2476d2ef9b737e2359272f40f9f4085",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+xbsl-sonar = "xbsl_sonar.cli:main"
+
+[project.entry-points."xbsl.rules"]
+xbsl-sonar = "xbsl_sonar.rules"
+
+[tool.setuptools]
+packages = ["xbsl_sonar"]
+
+[tool.setuptools.dynamic]
+version = { attr = "xbsl_sonar.__version__" }

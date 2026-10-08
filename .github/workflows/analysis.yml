@@ -2,9 +2,9 @@
 #
 #   jobs:
 #     analysis:
-#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.1.1
+#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.2.0
 #       with:
-#         version: v0.1.1
+#         version: v0.2.0
 #         sonar-url: ${{ vars.SONAR_URL }}
 #       secrets:
 #         sonar-token: ${{ secrets.SONAR_TOKEN }}

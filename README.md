@@ -14,6 +14,7 @@
 
 | Код | Что ловит | CWE |
 |---|---|---|
+| ПР-01 | метод `@НаСервере @ДоступноСКлиента` принимает ссылку на объект и открывает привилегированный контекст без сверки с текущим пользователем. Сверка — вызов метода, читающего текущего пользователя (набор собирается по проверяемому коду и замыкается по вызовам), `ТекущийПользователь` в условии `если` или `КонтрольДоступа.ПроверитьПраво`/`ЕстьПраво` до повышения прав. Не находка — метод без параметров-ссылок или без повышения прав | CWE-639, 862, 863 |
 | ПР-15 | обращение к данным в цикле: запрос в теле цикла `для`; вызов серверного метода того же модуля из цикла клиентского метода. Не находка — запрос в заголовке цикла, запрос в цикле `пока` (порции, уровни дерева), запись объектов в цикле | CWE-1050 |
 
 Полные описания — `xbsl-sonar rules-file` (тот же текст видит SonarQube).
@@ -32,7 +33,7 @@
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install "xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@v0.1.1"
+.venv/bin/pip install "xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@v0.2.0"
 
 .venv/bin/xbsl-sonar check <каталог проекта> --help-dir <выгрузка справки> \
     --json находки.json
@@ -47,7 +48,7 @@ python3 -m venv .venv
 
 Полезное:
 
-- `--rules ПР-15` — только перечисленные правила;
+- `--rules ПР-01,ПР-15` — только перечисленные правила;
 - `xbsl-sonar data --help-dir <справка> --out <каталог>` — собрать данные о языке один раз
   и дальше запускать `check --data-dir <каталог>`.
 
@@ -80,9 +81,9 @@ on:
   workflow_dispatch:
 jobs:
   analysis:
-    uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.1.1
+    uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.2.0
     with:
-      version: v0.1.1
+      version: v0.2.0
       paths: src
       help-dir: docs/vendor
       sonar-url: ${{ vars.SONAR_URL }}      # пусто — без SonarQube

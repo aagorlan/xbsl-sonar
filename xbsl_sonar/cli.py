@@ -11,19 +11,65 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 from xbsl_sonar import __version__, data, report
-from xbsl_sonar.rules import RULE_IDS
+from xbsl_sonar.rules import IDENTITY_ENV, RULE_IDS
+
+_METHOD = re.compile(r"^\s*(?:статический\s+|static\s+)?(?:метод|method)\s+(\w+)", re.IGNORECASE)
+_CURRENT_USER = re.compile(r"\b(?:ТекущийПользователь|CurrentUser)\b")
+
+
+_CALL = re.compile(r"(?<![\w.])(?:(\w+)\s*\.\s*)?(\w+)\s*\(")
+
+
+def identity_methods(paths: list[str]) -> set[str]:
+    """Методы, которые сверяют с текущим пользователем (для ПР-01), — `Модуль.Метод`.
+
+    Такой метод читает `ТекущийПользователь` или вызывает другой такой метод — набор
+    замыкается по вызовам: `ПроверитьПрава()`, зовущий `ЭтоАдминистратор()`, тоже сверка.
+    Модуль — имя элемента (файл `Модуль.xbsl`, `Модуль.Объект.xbsl`); вызов без модуля
+    относится к своему. Разбор по строкам: тело метода — от заголовка до следующего.
+    """
+    bodies: dict[str, list[str]] = {}
+    files: list[Path] = []
+    for p in map(Path, paths):
+        files.extend(sorted(p.rglob("*.xbsl")) if p.is_dir() else [p])
+    for file in files:
+        module = file.name.split(".")[0]
+        current = None
+        for line in file.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = _METHOD.match(line)
+            if m:
+                current = f"{module}.{m.group(1)}"
+                bodies.setdefault(current, [])
+            elif current:
+                bodies[current].append(line)
+    calls: dict[str, set[str]] = {}
+    found: set[str] = set()
+    for key, lines in bodies.items():
+        text = "\n".join(lines)
+        own = key.split(".")[0]
+        calls[key] = {f"{q or own}.{name}" for q, name in _CALL.findall(text)}
+        if _CURRENT_USER.search(text):
+            found.add(key)
+    while True:
+        more = {key for key, called in calls.items() if key not in found and called & found}
+        if not more:
+            return found
+        found |= more
 
 
 def _run_engine(paths: list[str], data_dir: Path, rules: list[str]) -> list[report.Finding]:
     cmd = [sys.executable, "-m", "xbsl", "--data-dir", str(data_dir), "--lang", "ru",
            "--select", ",".join(rules), "--format", "json", *paths]
-    done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths)))})
+    done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
     try:
         result = json.loads(done.stdout)
     except json.JSONDecodeError:

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -30,6 +31,39 @@ class RuleText:
 
 
 RULES: dict[str, RuleText] = {
+    "ПР-01": RuleText(
+        code="ПР-01",
+        name="Объект по ссылке с клиента под повышенными правами",
+        description=(
+            "<p>Метод, доступный с клиента, принимает ссылку на объект и работает с ней "
+            "в привилегированном контексте, ни разу не сверившись с текущим пользователем. "
+            "Аргументы такого метода приходят с клиента: подставив чужую ссылку, пользователь "
+            "прочитает или изменит то, на что у него нет прав, — права объекта "
+            "привилегированный контекст отключает.</p>"
+            "<p><b>Находка:</b> метод с аннотациями <code>@НаСервере @ДоступноСКлиента</code>, "
+            "у которого есть параметр типа <code>….Ссылка</code>, в теле открыт "
+            "<code>КонтекстДоступа.Привилегированный()</code>, а сверки с текущим "
+            "пользователем нет. Сверка — вызов метода, который читает текущего пользователя "
+            "или сам зовёт такой метод (набор собирается по всему проверяемому коду: "
+            "<code>ПолучитьУчастника()</code>, <code>ЭтоАдминистратор()</code>, "
+            "<code>ПроверитьПрава()</code>…), либо <code>ТекущийПользователь</code> в условии "
+            "<code>если</code>, либо проверка права объекта <code>КонтрольДоступа.ПроверитьПраво</code> "
+            "или <code>ЕстьПраво</code> до повышения прав. Текущий пользователь, только "
+            "записанный в данные, сверкой не считается.</p>"
+            "<p><b>Не находка:</b> метод без параметров-ссылок (участник берётся на сервере); "
+            "метод без привилегированного контекста — действуют права объекта; метод, "
+            "сверяющий ссылку с текущим пользователем или проверяющий администратора.</p>"
+            "<p><b>Как исправить:</b> брать текущего пользователя или участника на сервере, "
+            "а не из параметра; если ссылка нужна — сверить её с текущим пользователем "
+            "до открытия привилегированного контекста или не повышать права.</p>"
+            "<p>CWE-639: Authorization Bypass Through User-Controlled Key; CWE-862, CWE-863 "
+            "(OWASP A01:2021 Broken Access Control).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="CRITICAL",
+        cwe="CWE-639",
+        effort_minutes=30,
+    ),
     "ПР-15": RuleText(
         code="ПР-15",
         name="Обращение к данным в цикле",
@@ -69,6 +103,16 @@ _OPENERS = {
 }
 _CLIENT = {"НаКлиенте", "OnClient"}
 _SERVER = {"НаСервере", "OnServer"}
+_FROM_CLIENT = {"ДоступноСКлиента", "AvailableFromClient"}
+_PRIVILEGED = {"Привилегированный", "Privileged"}
+_CURRENT_USER = {"ТекущийПользователь", "CurrentUser"}
+_REFERENCE = {"Ссылка", "Ref"}
+# `КонтрольДоступа.ПроверитьПраво(Объект, …)` / `ЕстьПраво` — сверка правами самого объекта
+_RIGHT_CHECK = {"ПроверитьПраво", "ЕстьПраво", "CheckRight", "HasRight"}
+
+# Методы проверяемого кода, которые читают текущего пользователя: их собирает `check`
+# до запуска движка (`identity_methods`) и передаёт сюда через окружение.
+IDENTITY_ENV = "XBSL_SONAR_IDENTITY"
 
 
 @dataclass
@@ -187,5 +231,97 @@ def access_in_loop(source: SourceFile) -> Iterable[Diagnostic]:
                     f"клиентского метода '{method.method}': каждый виток – отдельный вызов "
                     f"сервера. Передать на сервер весь набор одним вызовом.",
                 ))
+        prev = t
+    return out
+
+
+def _reference_params(toks: list, i: int) -> list[str]:
+    """Имена параметров метода (токен `метод` с индексом i), тип которых — `….Ссылка`."""
+    k = i + 2
+    if k >= len(toks) or toks[k].value != "(":
+        return []
+    depth, names, current, is_ref = 0, [], None, False
+    while k < len(toks):
+        t = toks[k]
+        if t.kind == "OP" and t.value in "(<[":
+            depth += 1
+        elif t.kind == "OP" and t.value in ")>]":
+            depth -= 1
+            if depth == 0:
+                break
+        elif t.kind == "OP" and t.value == "," and depth == 1:
+            if current and is_ref:
+                names.append(current)
+            current, is_ref = None, False
+        elif depth == 1 and t.kind == "IDENT" and current is None:
+            current = t.value
+        elif t.kind == "IDENT" and t.value in _REFERENCE and toks[k - 1].value == ".":
+            is_ref = True
+        k += 1
+    if current and is_ref:
+        names.append(current)
+    return names
+
+
+@rule("ПР-01", "Объект по ссылке с клиента под повышенными правами", "S",
+      severity=Severity.WARNING)
+def reference_from_client(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    identity = set(filter(None, os.environ.get(IDENTITY_ENV, "").split(",")))
+    own = source.path.name.split(".")[0]
+    toks = code_tokens(source)
+    out: list[Diagnostic] = []
+    frames: list[str] = []
+    method = None  # (имя, строка, параметры-ссылки, глубина, привилегии, сверка)
+    condition = -1  # строка последнего `если`: сверка — обращение к пользователю в условии
+    prev = None
+    for i, t in enumerate(toks):
+        if t.kind == "KEYWORD" and t.canonical in _OPENERS and t.value[:1].islower():
+            is_else_if = (t.canonical == "IF" and prev is not None and prev.kind == "KEYWORD"
+                          and prev.canonical == "ELSE" and prev.line == t.line)
+            is_abstract = (t.canonical == "METHOD" and prev is not None and prev.kind == "KEYWORD"
+                           and prev.canonical == "ABSTRACT")
+            if t.canonical == "IF":
+                condition = t.line
+            if not is_else_if and not is_abstract:
+                frames.append(t.canonical)
+                if t.canonical == "METHOD":
+                    static = prev is not None and prev.value in ("статический", "static")
+                    ann = _annotations(toks, i - 1 if static else i)
+                    params = _reference_params(toks, i)
+                    if ann & _SERVER and ann & _FROM_CLIENT and params:
+                        method = [_method_name(toks, i), t.line, params, len(frames), False, False]
+                    else:
+                        method = None
+        elif t.kind == "OP" and t.value == ";":
+            if frames:
+                if method is not None and len(frames) == method[3]:
+                    name, line, params, _, privileged, checked = method
+                    if privileged and not checked:
+                        out.append(Diagnostic(
+                            source.rel, line, 1, "ПР-01", Severity.WARNING,
+                            f"Метод '{name}' доступен с клиента, принимает ссылку "
+                            f"({', '.join(params)}) и открывает привилегированный контекст "
+                            f"без сверки с текущим пользователем: подставленная с клиента "
+                            f"ссылка даст доступ к чужому объекту. Брать пользователя "
+                            f"на сервере или сверить ссылку до повышения прав.",
+                        ))
+                    method = None
+                frames.pop()
+        elif method is not None and t.kind == "IDENT":
+            if t.value in _PRIVILEGED:
+                method[4] = True
+            elif t.value in _RIGHT_CHECK and not method[4]:
+                method[5] = True
+            elif t.value in _CURRENT_USER and t.line == condition:
+                method[5] = True
+            elif i + 1 < len(toks) and toks[i + 1].value == "(" and not (
+                    prev is not None and prev.kind == "KEYWORD" and prev.canonical == "METHOD"):
+                qualified = (prev is not None and prev.value == "." and i >= 2
+                             and toks[i - 2].kind == "IDENT")
+                module = toks[i - 2].value if qualified else own
+                if f"{module}.{t.value}" in identity:
+                    method[5] = True
         prev = t
     return out

@@ -183,6 +183,6 @@ def test_mark_for_another_rule_does_not_apply(tmp_path, monkeypatch, data_dir):
 
 def test_rules_file_matches_plugin_format():
     rules = report.rules_file()["rules"]
-    assert [r["code"] for r in rules] == ["PR-15"]
+    assert [r["code"] for r in rules] == ["PR-01", "PR-15"]
     assert set(rules[0]) == {"code", "name", "description", "type", "severity", "active",
                              "needForCertificate", "effortMinutes", "internalCode"}

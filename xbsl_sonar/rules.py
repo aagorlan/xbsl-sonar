@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -91,6 +92,37 @@ RULES: dict[str, RuleText] = {
         severity="MAJOR",
         cwe="CWE-1050",
         effort_minutes=30,
+    ),
+    "ПР-03": RuleText(
+        code="ПР-03",
+        name="Точка без аутентификации вне согласованного перечня",
+        description=(
+            "<p>Элемент открыт тем, кто не вошёл в приложение, или код гостя работает "
+            "с повышенными правами. Каждая такая точка — часть периметра безопасности: "
+            "её открывают намеренно и проверяют отдельно, а не узнают о ней после выпуска.</p>"
+            "<p><b>Находка:</b></p><ul>"
+            "<li>в YAML — <code>РежимАутентификации: НеАутентифицированный</code>, "
+            "право со значением <code>РазрешеноВсем</code> (в том числе "
+            "<code>Вызов: РазрешеноВсем</code> HTTP-сервиса), элемент "
+            "<code>ВидЭлемента: HttpСервис</code>;</li>"
+            "<li>в XBSL — <code>КонтекстДоступа.Привилегированный()</code> в модуле элемента, "
+            "у которого в паре <code>.yaml</code> задан "
+            "<code>РежимАутентификации: НеАутентифицированный</code>.</li>"
+            "</ul><p><b>Не находка:</b> точка из перечня периметра (параметр "
+            "<code>--perimeter</code>: строка <code>путь: Ключ</code>) или с пометкой "
+            "<code>анализ:периметр — причина</code> в строке находки или строкой выше; "
+            "права <code>РазрешеноАутентифицированным</code> и уже; привилегированный "
+            "контекст в модуле элемента для вошедших.</p>"
+            "<p><b>Как исправить:</b> если точка открыта намеренно — внести её в перечень "
+            "периметра, чтобы решение было видно в PR; если нет — закрыть: права "
+            "<code>РазрешеноАутентифицированным</code>, без повышения прав в коде гостя.</p>"
+            "<p>CWE-732: Incorrect Permission Assignment for Critical Resource; CWE-284, "
+            "CWE-276 (OWASP A01:2021 Broken Access Control).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MAJOR",
+        cwe="CWE-732",
+        effort_minutes=15,
     ),
 }
 
@@ -324,4 +356,47 @@ def reference_from_client(source: SourceFile) -> Iterable[Diagnostic]:
                 if f"{module}.{t.value}" in identity:
                     method[5] = True
         prev = t
+    return out
+
+
+# ПР-03: точки периметра. Ключ находки — первое слово сообщения до двоеточия: по нему
+# `check` сверяет находку с перечнем периметра (`путь: Ключ`).
+_YAML_UNAUTH = re.compile(r"^\s*(РежимАутентификации|AuthenticationMode):\s*"
+                          r"(НеАутентифицированный|NotAuthenticated)\s*$")
+_YAML_ALL = re.compile(r"^\s*([^\s:#][^:#]*?):\s*(РазрешеноВсем|AllowedForAll)\s*$")
+_YAML_HTTP = re.compile(r"^(ВидЭлемента|ElementKind):\s*(HttpСервис|HttpService)\s*$")
+
+
+def _pair_unauthenticated(source: SourceFile) -> bool:
+    pair = source.path.with_name(source.path.name.split(".")[0] + ".yaml")
+    try:
+        text = pair.read_text(encoding="utf-8-sig")
+    except OSError:
+        return False
+    return any(_YAML_UNAUTH.match(line) for line in text.splitlines())
+
+
+@rule("ПР-03", "Точка без аутентификации вне согласованного перечня", "S",
+      severity=Severity.WARNING)
+def perimeter(source: SourceFile) -> Iterable[Diagnostic]:
+    out: list[Diagnostic] = []
+    if source.kind == "yaml":
+        for n, line in enumerate(source.text.splitlines(), 1):
+            m = _YAML_UNAUTH.match(line) or _YAML_HTTP.match(line) or _YAML_ALL.match(line)
+            if m:
+                key = m.group(1).strip()
+                out.append(Diagnostic(
+                    source.rel, n, line.find(key) + 1, "ПР-03", Severity.WARNING,
+                    f"{key}: {m.group(2)} — точка без аутентификации. Открыта намеренно — "
+                    f"внести в перечень периметра; нет — закрыть.",
+                ))
+    elif source.kind == "xbsl" and _pair_unauthenticated(source):
+        for t in code_tokens(source):
+            if t.kind == "IDENT" and t.value in _PRIVILEGED:
+                out.append(Diagnostic(
+                    source.rel, t.line, t.col, "ПР-03", Severity.WARNING,
+                    f"{t.value}: повышение прав в модуле элемента для неаутентифицированных — "
+                    f"гость получает данные в обход прав. Пометить «анализ:периметр — причина», "
+                    f"если отдаётся ровно то, что решено показать гостю.",
+                ))
     return out

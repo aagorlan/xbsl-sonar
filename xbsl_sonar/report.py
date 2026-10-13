@@ -13,6 +13,10 @@ from xbsl_sonar.rules import RULES
 # `// анализ:исключение ПР-15 ТД-12 — причина` — в строке находки или строкой выше.
 # Пункт долга обязателен: исключение без него не действует.
 MARK = re.compile(r"//\s*анализ:исключение\s+(ПР-\d+)\s+(\S+)(?:\s+[—–-]\s*(.*))?")
+# `// анализ:периметр — причина` (в YAML — `#`) — точка периметра открыта намеренно (ПР-03).
+# Это не долг: находка закрывается решением, записанным в перечне периметра проекта.
+PERIMETER_MARK = re.compile(r"(?://|#)\s*анализ:периметр(?:\s+[—–-]\s*(.*))?")
+PERIMETER = "периметр"
 
 
 @dataclass
@@ -49,6 +53,34 @@ def apply_exceptions(findings: list[Finding], root: Path) -> None:
                     f.debt = m.group(2)
                     f.reason = (m.group(3) or "").strip() or None
                     break
+                p = PERIMETER_MARK.search(lines[n - 1]) if f.rule == "ПР-03" else None
+                if p:
+                    f.debt = PERIMETER
+                    f.reason = (p.group(1) or "").strip() or None
+                    break
+
+
+def read_perimeter(path: Path) -> set[tuple[str, str]]:
+    """Перечень периметра: строки `путь: Ключ — причина`; пустые и `#…` пропускаются."""
+    out: set[tuple[str, str]] = set()
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        where, _, rest = line.partition(": ")
+        key = re.split(r"\s+[—–-]\s", rest, maxsplit=1)[0].strip()
+        if where and key:
+            out.add((where.strip(), key))
+    return out
+
+
+def apply_perimeter(findings: list[Finding], allowed: set[tuple[str, str]]) -> None:
+    """Находка ПР-03 в точке из перечня периметра — под решением, не открытая."""
+    for f in findings:
+        if f.rule == "ПР-03" and f.debt is None:
+            key = f.message.split(":", 1)[0]
+            if (f.path, key) in allowed:
+                f.debt = PERIMETER
 
 
 def marks(paths: list[Path]) -> list[tuple[Path, int, str, str]]:

@@ -33,7 +33,7 @@
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install "xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@v0.2.0"
+.venv/bin/pip install "xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@v0.2.1"
 
 .venv/bin/xbsl-sonar check <каталог проекта> --help-dir <выгрузка справки> \
     --json находки.json
@@ -81,13 +81,14 @@ on:
   workflow_dispatch:
 jobs:
   analysis:
-    uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.2.0
+    uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.2.1
     with:
-      version: v0.2.0
+      version: v0.2.1
       paths: src
       help-dir: docs/vendor
       sonar-url: ${{ vars.SONAR_URL }}      # пусто — без SonarQube
       runs-on: ubuntu-latest               # или self-hosted
+      # scanner-path: /opt/sonar-scanner/bin/sonar-scanner   # готовый сканер на своём исполнителе
     secrets:
       sonar-token: ${{ secrets.SONAR_TOKEN }}
 ```
@@ -97,6 +98,12 @@ jobs:
 если есть находка без пометки исключения. Сканер SonarQube скачивается со встроенной
 Java — ставить её на исполнитель не нужно. На своём исполнителе нужны Python 3.10+
 с модулем `venv`, `curl` и `unzip`.
+
+Сканер берётся с `binaries.sonarsource.com`, а если оттуда не отдают (на российские IP —
+ответ 403), — тот же архив с Maven Central. На своём исполнителе сканер можно поставить
+заранее и передать путь в `scanner-path` (например, `/opt/sonar-scanner/bin/sonar-scanner`):
+тогда он не скачивается в каждом запуске. Версия готового сканера — на совести исполнителя,
+`scanner-version` для него не действует.
 
 ### Руками
 

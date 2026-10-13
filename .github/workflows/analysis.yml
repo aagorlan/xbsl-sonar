@@ -37,6 +37,10 @@ on:
         description: 'Версия sonar-scanner CLI'
         type: string
         default: '8.1.0.6389'
+      scanner-path:
+        description: 'Готовый sonar-scanner на исполнителе (путь к bin/sonar-scanner); пусто — скачать'
+        type: string
+        default: ''
       runs-on:
         description: 'Исполнитель'
         type: string
@@ -99,6 +103,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.sonar-token }}
           SONAR_URL: ${{ inputs.sonar-url }}
           SCANNER: ${{ inputs.scanner-version }}
+          SCANNER_PATH: ${{ inputs.scanner-path }}
           # Имена веток — через окружение, не подстановкой в текст скрипта: имя ветки PR
           # выбирает его автор.
           EVENT: ${{ github.event_name }}
@@ -112,11 +117,24 @@ jobs:
             echo 'Не передан секрет sonar-token' | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          dir="$RUNNER_TEMP/sonar-scanner-$SCANNER-linux-x64"
-          if [ ! -x "$dir/bin/sonar-scanner" ]; then
-            curl -sSfL -o "$RUNNER_TEMP/scanner.zip" \
-              "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-$SCANNER-linux-x64.zip"
-            unzip -q -o "$RUNNER_TEMP/scanner.zip" -d "$RUNNER_TEMP"
+          # Готовый сканер на своём исполнителе — без скачивания. Иначе — с binaries.sonarsource.com,
+          # а если оттуда не отдают (403 на российские IP), — тот же архив с Maven Central.
+          if [ -n "$SCANNER_PATH" ]; then
+            if [ ! -x "$SCANNER_PATH" ]; then
+              echo "Нет сканера по пути scanner-path: $SCANNER_PATH" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            scanner="$SCANNER_PATH"
+          else
+            scanner="$RUNNER_TEMP/sonar-scanner-$SCANNER-linux-x64/bin/sonar-scanner"
+            if [ ! -x "$scanner" ]; then
+              zip="sonar-scanner-cli-$SCANNER-linux-x64.zip"
+              curl -sSfL -o "$RUNNER_TEMP/scanner.zip" \
+                "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/$zip" \
+              || curl -sSfL -o "$RUNNER_TEMP/scanner.zip" \
+                "https://repo1.maven.org/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/$SCANNER/$zip"
+              unzip -q -o "$RUNNER_TEMP/scanner.zip" -d "$RUNNER_TEMP"
+            fi
           fi
           if [ "$EVENT" = "pull_request" ]; then
             branch_args=(-Dsonar.pullrequest.key="$PR_NUMBER" -Dsonar.pullrequest.branch="$HEAD_REF"
@@ -124,7 +142,7 @@ jobs:
           else
             branch_args=(-Dsonar.branch.name="$REF_NAME")
           fi
-          "$dir/bin/sonar-scanner" \
+          "$scanner" \
             -Dsonar.host.url="$SONAR_URL" \
             -Dsonar.bsl.languageserver.enabled=false \
             -Dsonar.bsl.languageserver.reportPaths=.xbsl-sonar/bsl-report.json \

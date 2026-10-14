@@ -1,6 +1,7 @@
 """Командная строка xbsl-sonar.
 
-    xbsl-sonar check IT --help-dir docs/vendor [--bsl-report отчёт.json] [--json находки.json]
+    xbsl-sonar check IT --help-dir docs/vendor [--perimeter периметр.txt] [--bsl-report отчёт.json]
+                    [--json находки.json]
     xbsl-sonar data --help-dir docs/vendor --out каталог
     xbsl-sonar rules-file --out universal.json
 
@@ -94,6 +95,8 @@ def _check(args) -> int:
         data_dir = Path(args.data_dir) if args.data_dir else data.build(Path(args.help_dir), Path(tmp))
         findings = _run_engine(args.paths, data_dir, rules)
     report.apply_exceptions(findings, root)
+    if args.perimeter:
+        report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))
     open_ = [f for f in findings if f.debt is None]
     for f in findings:
         mark = "" if f.debt is None else f" (исключение по {f.debt})"
@@ -131,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--help-dir", help="выгрузка справки 1С:Элемент (каталог с topics/)")
     src.add_argument("--data-dir", help="готовые данные о языке (xbsl-sonar data)")
     c.add_argument("--rules", help="правила через запятую; по умолчанию все")
+    c.add_argument("--perimeter", help="перечень периметра для ПР-03: строки «путь: Ключ — причина»")
     c.add_argument("--json", help="находки файлом JSON")
     c.add_argument("--bsl-report", help="отчёт для SonarQube (формат BSL Language Server)")
     c.set_defaults(func=_check)

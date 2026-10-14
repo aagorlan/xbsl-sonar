@@ -2,9 +2,10 @@
 #
 #   jobs:
 #     analysis:
-#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.2.0
+#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.3.0
 #       with:
-#         version: v0.2.0
+#         version: v0.3.0
+#         perimeter: docs/периметр.txt   # для ПР-03, можно не задавать
 #         sonar-url: ${{ vars.SONAR_URL }}
 #       secrets:
 #         sonar-token: ${{ secrets.SONAR_TOKEN }}
@@ -29,6 +30,10 @@ on:
         description: 'Выгрузка справки 1С:Элемент (каталог с topics/)'
         type: string
         default: 'docs/vendor'
+      perimeter:
+        description: 'Перечень периметра для ПР-03 (строки «путь: Ключ — причина»); пусто — без перечня'
+        type: string
+        default: ''
       sonar-url:
         description: 'Адрес SonarQube; пусто — без SonarQube'
         type: string
@@ -72,8 +77,10 @@ jobs:
           set -u
           mkdir -p .xbsl-sonar
           rc=0
+          perimeter=()
+          [ -z "${{ inputs.perimeter }}" ] || perimeter=(--perimeter "${{ inputs.perimeter }}")
           "$RUNNER_TEMP/xbsl-sonar/bin/xbsl-sonar" check ${{ inputs.paths }} \
-            --help-dir "${{ inputs.help-dir }}" \
+            --help-dir "${{ inputs.help-dir }}" "${perimeter[@]}" \
             --json .xbsl-sonar/findings.json \
             --bsl-report .xbsl-sonar/bsl-report.json || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"

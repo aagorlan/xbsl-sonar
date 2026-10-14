@@ -1,6 +1,7 @@
 """Командная строка xbsl-sonar.
 
-    xbsl-sonar check IT --help-dir docs/vendor [--perimeter периметр.txt] [--bsl-report отчёт.json]
+    xbsl-sonar check IT --help-dir docs/vendor [--perimeter периметр.txt] [--sanitizers очистить]
+                    [--bsl-report отчёт.json]
                     [--json находки.json]
     xbsl-sonar data --help-dir docs/vendor --out каталог
     xbsl-sonar rules-file --out universal.json
@@ -20,7 +21,7 @@ import tempfile
 from pathlib import Path
 
 from xbsl_sonar import __version__, data, report
-from xbsl_sonar.rules import IDENTITY_ENV, RULE_IDS
+from xbsl_sonar.rules import IDENTITY_ENV, RULE_IDS, SANITIZERS_ENV
 
 _METHOD = re.compile(r"^\s*(?:статический\s+|static\s+)?(?:метод|method)\s+(\w+)", re.IGNORECASE)
 _CURRENT_USER = re.compile(r"\b(?:ТекущийПользователь|CurrentUser)\b")
@@ -66,10 +67,12 @@ def identity_methods(paths: list[str]) -> set[str]:
         found |= more
 
 
-def _run_engine(paths: list[str], data_dir: Path, rules: list[str]) -> list[report.Finding]:
+def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
+                sanitizers: str = "") -> list[report.Finding]:
     cmd = [sys.executable, "-m", "xbsl", "--data-dir", str(data_dir), "--lang", "ru",
            "--select", ",".join(rules), "--format", "json", *paths]
-    env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths)))})
+    env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths))),
+                              SANITIZERS_ENV: sanitizers})
     done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
     try:
         result = json.loads(done.stdout)
@@ -93,7 +96,7 @@ def _check(args) -> int:
         return 2
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(args.data_dir) if args.data_dir else data.build(Path(args.help_dir), Path(tmp))
-        findings = _run_engine(args.paths, data_dir, rules)
+        findings = _run_engine(args.paths, data_dir, rules, args.sanitizers or "")
     report.apply_exceptions(findings, root)
     if args.perimeter:
         report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))
@@ -135,6 +138,8 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--data-dir", help="готовые данные о языке (xbsl-sonar data)")
     c.add_argument("--rules", help="правила через запятую; по умолчанию все")
     c.add_argument("--perimeter", help="перечень периметра для ПР-03: строки «путь: Ключ — причина»")
+    c.add_argument("--sanitizers", help="функции очистки разметки для ПР-04 через запятую; "
+                                        "по умолчанию «очистить»")
     c.add_argument("--json", help="находки файлом JSON")
     c.add_argument("--bsl-report", help="отчёт для SonarQube (формат BSL Language Server)")
     c.set_defaults(func=_check)

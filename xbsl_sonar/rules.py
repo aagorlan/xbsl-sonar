@@ -124,6 +124,40 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-732",
         effort_minutes=15,
     ),
+    "ПР-04": RuleText(
+        code="ПР-04",
+        name="Разметка из данных выполняется в браузере без очистки",
+        description=(
+            "<p>Разметка, пришедшая из данных, вставляется в страницу там, где браузер "
+            "выполнит её скрипты: в HTML-контейнер с выключенным безопасным режимом или "
+            "присваиванием <code>innerHTML</code> в скрипте ресурса. Текст, который ввёл "
+            "пользователь, становится кодом у того, кто его открыл.</p>"
+            "<p><b>Находка:</b></p><ul>"
+            "<li>в YAML — компонент <code>КонтейнерHtml</code> с <code>БезопасныйРежим: Ложь</code>, "
+            "у которого <code>Содержимое</code> — выражение (<code>=…</code>), а не "
+            "<code>Ресурс{…}</code>: содержимое считается при работе и может прийти из данных;</li>"
+            "<li>в XBSL — присваивание <code>….Имя.Содержимое = …</code> компоненту такого "
+            "контейнера из пары <code>.yaml</code>, если справа не <code>Ресурс{…}</code>;</li>"
+            "<li>в ресурсе <code>.html</code> / <code>.js</code> — <code>.innerHTML = …</code> "
+            "со значением, которое не строковый литерал, вне функции очистки "
+            "(по умолчанию <code>очистить</code>; параметр <code>--sanitizers</code>).</li>"
+            "</ul><p><b>Не находка:</b> контейнер с безопасным режимом по умолчанию — платформа "
+            "запрещает в нём запуск скриптов; содержимое из ресурса; <code>innerHTML</code> "
+            "внутри функции очистки или со строковым литералом; находка из перечня согласованных "
+            "(параметр <code>--agreed</code>: строка <code>путь: ПР-04 Ключ — причина</code>, "
+            "ключ — начало сообщения до двоеточия).</p>"
+            "<p><b>Как исправить:</b> оставить безопасный режим; если скрипт нужен — давать "
+            "контейнеру ресурс, а данные передавать вызовом функции скрипта; в скрипте — "
+            "пропускать разметку через функцию очистки с перечнем разрешённых тегов "
+            "или писать текст через <code>textContent</code>.</p>"
+            "<p>CWE-79: Improper Neutralization of Input During Web Page Generation "
+            "(OWASP A03:2021 Injection).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="CRITICAL",
+        cwe="CWE-79",
+        effort_minutes=30,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -145,6 +179,9 @@ _RIGHT_CHECK = {"ПроверитьПраво", "ЕстьПраво", "CheckRigh
 # Методы проверяемого кода, которые читают текущего пользователя: их собирает `check`
 # до запуска движка (`identity_methods`) и передаёт сюда через окружение.
 IDENTITY_ENV = "XBSL_SONAR_IDENTITY"
+# Функции очистки разметки для ПР-04 — параметр `--sanitizers` команды `check`.
+SANITIZERS_ENV = "XBSL_SONAR_SANITIZERS"
+DEFAULT_SANITIZERS = ("очистить",)
 
 
 @dataclass
@@ -400,3 +437,159 @@ def perimeter(source: SourceFile) -> Iterable[Diagnostic]:
                     f"если отдаётся ровно то, что решено показать гостю.",
                 ))
     return out
+
+
+# ПР-04: разметка из данных без очистки. Контейнер ищется в YAML по строке `Тип: КонтейнерHtml`,
+# его свойства — строки с тем же отступом до конца компонента.
+_YAML_CONTAINER = re.compile(r"^(\s*)(-\s+)?Тип:\s*КонтейнерHtml\s*$")
+_YAML_KEY = re.compile(r"^(\s*)(?:-\s+)?([^\s:#][^:#]*?):\s*(.*?)\s*$")
+_INNER_HTML = re.compile(r"\.innerHTML\s*=(?!=)\s*(.)")
+_FUNCTION = re.compile(r"function\s+([^\s(]+)\s*\(")
+_CALL = re.compile(r"^=\s*(\w+)\(\)$")
+# Подстановка в ресурс безопасна, если в подставляемом экранирован `<`: тогда ни тег,
+# ни `</script>` из данных не закроют скрипт и не откроют свой
+_ESCAPED_LT = re.compile(r"\.Заменить\(\s*\"<\"\s*,\s*\"\\\\u003c\"\s*\)")
+_CONSTANT_RHS = re.compile(r"^(?:\s|\(|\)|\|\||\+|'[^']*'|\"[^\"]*\"|[A-ZА-ЯЁ_][A-ZА-ЯЁ0-9_]*(?:\[[^\]]*\])?)*$")
+
+
+def _method_body(text: str, name: str) -> str | None:
+    m = re.search(rf"метод\s+{re.escape(name)}\s*\(", text)
+    if not m:
+        return None
+    end = text.find("\n;", m.end())
+    return text[m.end():end if end >= 0 else len(text)]
+
+
+def _returns_resource(text: str, name: str, depth: int = 3) -> bool:
+    """Метод модуля возвращает текст ресурса — сам или через метод того же модуля."""
+    body = _method_body(text, name)
+    if body is None or depth == 0:
+        return False
+    if "Ресурс{" in body:
+        substituted = "Заменить(" in body
+        return not substituted or bool(_ESCAPED_LT.search(body))
+    call = re.search(r"возврат\s+(\w+)\(", body)
+    return bool(call) and _returns_resource(text, call.group(1), depth - 1)
+
+
+
+def _unsafe_containers(text: str) -> list[tuple[str, int, str]]:
+    """Контейнеры с выключенным безопасным режимом: (имя, строка Содержимое, значение)."""
+    lines = text.splitlines()
+    found: list[tuple[str, int, str]] = []
+    for n, line in enumerate(lines):
+        m = _YAML_CONTAINER.match(line)
+        if not m:
+            continue
+        indent = len(m.group(1)) + len(m.group(2) or "")
+        props: dict[str, tuple[int, str]] = {}
+        for k in range(n + 1, len(lines)):
+            row = lines[k]
+            if not row.strip():
+                continue
+            own = len(row) - len(row.lstrip())
+            if own < indent or (own == indent - 2 and row.lstrip().startswith("-")):
+                break
+            km = _YAML_KEY.match(row)
+            if km and len(km.group(1)) == indent:
+                props[km.group(2).strip()] = (k + 1, km.group(3).strip("'\""))
+        if props.get("БезопасныйРежим", (0, ""))[1] in ("Ложь", "False"):
+            name = props.get("Имя", (0, ""))[1]
+            line_no, value = props.get("Содержимое", (n + 1, ""))
+            found.append((name, line_no, value))
+    return found
+
+
+def _sanitizers() -> set[str]:
+    names = set(filter(None, os.environ.get(SANITIZERS_ENV, "").split(",")))
+    return names or set(DEFAULT_SANITIZERS)
+
+
+def _function_ranges(text: str) -> list[tuple[str, int, int]]:
+    """Тела функций скрипта: (имя, начало, конец) по фигурным скобкам."""
+    ranges = []
+    for m in _FUNCTION.finditer(text):
+        start = text.find("{", m.end())
+        if start < 0:
+            continue
+        depth, k = 0, start
+        while k < len(text):
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        ranges.append((m.group(1), start, k))
+    return ranges
+
+
+@rule("ПР-04", "Разметка из данных выполняется в браузере без очистки", "S",
+      severity=Severity.WARNING)
+def unsanitized_html(source: SourceFile) -> Iterable[Diagnostic]:
+    out: list[Diagnostic] = []
+    if source.kind == "yaml":
+        for name, line, value in _unsafe_containers(source.text):
+            if value.startswith("=") and not value[1:].lstrip().startswith("Ресурс{") \
+                    and not _resource_function(source, value):
+                out.append(Diagnostic(
+                    source.rel, line, 1, "ПР-04", Severity.WARNING,
+                    f"КонтейнерHtml {name}: безопасный режим выключен, а содержимое считается "
+                    f"выражением ({value[:60]}) — разметка из данных выполнит свои скрипты. "
+                    f"Оставить безопасный режим или давать контейнеру ресурс.",
+                ))
+    elif source.kind == "xbsl":
+        pair = source.path.with_name(source.path.name.split(".")[0] + ".yaml")
+        try:
+            names = {n for n, _, _ in _unsafe_containers(pair.read_text(encoding="utf-8-sig")) if n}
+        except OSError:
+            names = set()
+        if names:
+            toks = code_tokens(source)
+            for i, t in enumerate(toks):
+                if (t.kind == "IDENT" and t.value == "Содержимое" and i >= 2
+                        and toks[i - 1].value == "." and toks[i - 2].value in names
+                        and i + 2 < len(toks) and toks[i + 1].value == "="
+                        and toks[i + 2].value not in ("Ресурс", "Resource")):
+                    out.append(Diagnostic(
+                        source.rel, t.line, t.col, "ПР-04", Severity.WARNING,
+                        f"Содержимое {toks[i - 2].value}: контейнеру с выключенным безопасным "
+                        f"режимом задаётся не ресурс — разметка из данных выполнит свои скрипты.",
+                    ))
+    elif source.kind in ("html", "js"):
+        text = source.text
+        clean = _sanitizers()
+        functions = _function_ranges(text)
+        for m in _INNER_HTML.finditer(text):
+            end = text.find(";", m.end(1) - 1)
+            rhs = text[m.end(1) - 1:end if end >= 0 else len(text)]
+            if m.group(1) in ("'", '"', "`") or _CONSTANT_RHS.match(rhs):
+                continue
+            pos = m.start()
+            inner = [f for f in functions if f[1] <= pos <= f[2]]
+            if inner and min(inner, key=lambda f: f[2] - f[1])[0] in clean:
+                continue
+            line = text.count("\n", 0, pos) + 1
+            col = pos - (text.rfind("\n", 0, pos) + 1) + 1
+            out.append(Diagnostic(
+                source.rel, line, col, "ПР-04", Severity.WARNING,
+                f"innerHTML: значение не литерал и не из констант, вне функции очистки "
+                f"({', '.join(sorted(clean))}) — разметка из данных выполнит свои скрипты. "
+                f"Пропустить через очистку или писать textContent.",
+            ))
+    return out
+
+
+def _resource_function(source: SourceFile, value: str) -> bool:
+    """`Содержимое: =Метод()`, где метод пары `.xbsl` отдаёт ресурс — без подстановок
+    или с подстановкой, в которой экранирован `<`."""
+    m = _CALL.match(value)
+    if not m:
+        return False
+    pair = source.path.with_name(source.path.name.split(".")[0] + ".xbsl")
+    try:
+        text = pair.read_text(encoding="utf-8-sig")
+    except OSError:
+        return False
+    return _returns_resource(text, m.group(1))

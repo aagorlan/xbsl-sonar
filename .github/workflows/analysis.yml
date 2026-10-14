@@ -6,6 +6,7 @@
 #       with:
 #         version: v0.4.0
 #         perimeter: docs/периметр.txt   # для ПР-03, можно не задавать
+#         agreed: docs/согласовано.txt   # для ПР-04, можно не задавать
 #         sonar-url: ${{ vars.SONAR_URL }}
 #       secrets:
 #         sonar-token: ${{ secrets.SONAR_TOKEN }}
@@ -32,6 +33,10 @@ on:
         default: 'docs/vendor'
       perimeter:
         description: 'Перечень периметра для ПР-03 (строки «путь: Ключ — причина»); пусто — без перечня'
+        type: string
+        default: ''
+      agreed:
+        description: 'Согласованные находки ПР-04 (строки «путь: ПР-04 Ключ — причина»); пусто — без перечня'
         type: string
         default: ''
       sonar-url:
@@ -79,8 +84,10 @@ jobs:
           rc=0
           perimeter=()
           [ -z "${{ inputs.perimeter }}" ] || perimeter=(--perimeter "${{ inputs.perimeter }}")
+          agreed=()
+          [ -z "${{ inputs.agreed }}" ] || agreed=(--agreed "${{ inputs.agreed }}")
           "$RUNNER_TEMP/xbsl-sonar/bin/xbsl-sonar" check ${{ inputs.paths }} \
-            --help-dir "${{ inputs.help-dir }}" "${perimeter[@]}" \
+            --help-dir "${{ inputs.help-dir }}" "${perimeter[@]}" "${agreed[@]}" \
             --json .xbsl-sonar/findings.json \
             --bsl-report .xbsl-sonar/bsl-report.json || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"

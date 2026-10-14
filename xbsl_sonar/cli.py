@@ -1,6 +1,7 @@
 """Командная строка xbsl-sonar.
 
     xbsl-sonar check IT --help-dir docs/vendor [--perimeter периметр.txt] [--sanitizers очистить]
+                    [--agreed согласовано.txt]
                     [--bsl-report отчёт.json]
                     [--json находки.json]
     xbsl-sonar data --help-dir docs/vendor --out каталог
@@ -100,6 +101,8 @@ def _check(args) -> int:
     report.apply_exceptions(findings, root)
     if args.perimeter:
         report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))
+    if args.agreed:
+        report.apply_agreed(findings, report.read_agreed(Path(args.agreed)))
     open_ = [f for f in findings if f.debt is None]
     for f in findings:
         mark = "" if f.debt is None else f" (исключение по {f.debt})"
@@ -138,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--data-dir", help="готовые данные о языке (xbsl-sonar data)")
     c.add_argument("--rules", help="правила через запятую; по умолчанию все")
     c.add_argument("--perimeter", help="перечень периметра для ПР-03: строки «путь: Ключ — причина»")
+    c.add_argument("--agreed", help="согласованные находки ПР-04: строки «путь: ПР-04 Ключ — причина»")
     c.add_argument("--sanitizers", help="функции очистки разметки для ПР-04 через запятую; "
                                         "по умолчанию «очистить»")
     c.add_argument("--json", help="находки файлом JSON")

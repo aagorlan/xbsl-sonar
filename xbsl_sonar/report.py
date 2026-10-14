@@ -17,6 +17,7 @@ MARK = re.compile(r"//\s*анализ:исключение\s+(ПР-\d+)\s+(\S+)(
 # Это не долг: находка закрывается решением, записанным в перечне периметра проекта.
 PERIMETER_MARK = re.compile(r"(?://|#)\s*анализ:периметр(?:\s+[—–-]\s*(.*))?")
 PERIMETER = "периметр"
+AGREED = "согласовано"
 
 
 @dataclass
@@ -81,6 +82,31 @@ def apply_perimeter(findings: list[Finding], allowed: set[tuple[str, str]]) -> N
             key = f.message.split(":", 1)[0]
             if (f.path, key) in allowed:
                 f.debt = PERIMETER
+
+
+def read_agreed(path: Path) -> set[tuple[str, str, str]]:
+    """Перечень согласованных находок: строки `путь: ПР-NN Ключ — причина`; пустые и `#…`
+    пропускаются. Причина обязательна: без неё строка — не решение, а заглушка."""
+    out: set[tuple[str, str, str]] = set()
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        where, _, rest = line.partition(": ")
+        m = re.match(r"(ПР-\d\d)\s+(.+?)\s+[—–-]\s+\S", rest)
+        if where and m:
+            out.add((where.strip(), m.group(1), m.group(2).strip()))
+    return out
+
+
+def apply_agreed(findings: list[Finding], allowed: set[tuple[str, str, str]]) -> None:
+    """Находка ПР-04 из перечня согласованных — под решением владельца, не открытая.
+    Ключ — сообщение находки до первого двоеточия."""
+    for f in findings:
+        if f.rule == "ПР-04" and f.debt is None:
+            key = f.message.split(":", 1)[0]
+            if (f.path, f.rule, key) in allowed:
+                f.debt = AGREED
 
 
 def marks(paths: list[Path]) -> list[tuple[Path, int, str, str]]:

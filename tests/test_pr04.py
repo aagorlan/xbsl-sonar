@@ -171,3 +171,20 @@ def test_unknown_sanitizer_is_a_finding(tmp_path, monkeypatch, data_dir):
         """,
     }
     assert check(tmp_path, monkeypatch, data_dir, files) == [("Виджет.html", 4)]
+
+
+def test_agreed_finding(tmp_path, monkeypatch, data_dir):
+    (tmp_path / "согласовано.txt").write_text(
+        "# путь: ПР-04 Ключ — причина\n"
+        "IT/Проект/Основное/Форма.yaml: ПР-04 КонтейнерHtml Текст — экранировано при подстановке\n"
+        "IT/Проект/Основное/Чужая.yaml: ПР-04 КонтейнерHtml Текст\n",
+        encoding="utf-8")
+    files = {"Форма.yaml": контейнер("Ложь", "=Объект.Текст")}
+    assert check(tmp_path, monkeypatch, data_dir, files, "--agreed", "согласовано.txt") == []
+
+
+def test_agreed_needs_reason(tmp_path, monkeypatch, data_dir):
+    (tmp_path / "согласовано.txt").write_text(
+        "IT/Проект/Основное/Форма.yaml: ПР-04 КонтейнерHtml Текст\n", encoding="utf-8")
+    files = {"Форма.yaml": контейнер("Ложь", "=Объект.Текст")}
+    assert [имя for имя, _ in check(tmp_path, monkeypatch, data_dir, files, "--agreed", "согласовано.txt")] == ["Форма.yaml"]

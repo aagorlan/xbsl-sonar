@@ -22,13 +22,16 @@ import tempfile
 from pathlib import Path
 
 from xbsl_sonar import __version__, data, report
-from xbsl_sonar.rules import IDENTITY_ENV, RULE_IDS, SANITIZERS_ENV
+from xbsl_sonar.rules import IDENTITY_ENV, MIN_PERIOD_ENV, RULE_IDS, SANITIZERS_ENV, SERVER_ENV
 
 _METHOD = re.compile(r"^\s*(?:статический\s+|static\s+)?(?:метод|method)\s+(\w+)", re.IGNORECASE)
 _CURRENT_USER = re.compile(r"\b(?:ТекущийПользователь|CurrentUser)\b")
 
 
 _CALL = re.compile(r"(?<![\w.])(?:(\w+)\s*\.\s*)?(\w+)\s*\(")
+_ANNOTATION = re.compile(r"@(\w+)")
+_ON_SERVER = {"НаСервере", "OnServer"}
+_ON_CLIENT = {"НаКлиенте", "OnClient"}
 
 
 def identity_methods(paths: list[str]) -> set[str]:
@@ -39,28 +42,47 @@ def identity_methods(paths: list[str]) -> set[str]:
     Модуль — имя элемента (файл `Модуль.xbsl`, `Модуль.Объект.xbsl`); вызов без модуля
     относится к своему. Разбор по строкам: тело метода — от заголовка до следующего.
     """
+    bodies, _ = _bodies(paths)
+    found = {key for key, lines in bodies.items() if _CURRENT_USER.search("\n".join(lines))}
+    return _closure(found, bodies)
+
+
+def _bodies(paths: list[str]) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
+    """Тела методов по строкам и их аннотации: `Модуль.Метод` → строки тела, аннотации.
+
+    Модуль — имя элемента (файл `Модуль.xbsl`, `Модуль.Объект.xbsl`); аннотации — строки
+    `@…` перед заголовком. Тело — от заголовка до следующего.
+    """
     bodies: dict[str, list[str]] = {}
+    annotations: dict[str, set[str]] = {}
     files: list[Path] = []
     for p in map(Path, paths):
         files.extend(sorted(p.rglob("*.xbsl")) if p.is_dir() else [p])
     for file in files:
         module = file.name.split(".")[0]
         current = None
+        pending: set[str] = set()
         for line in file.read_text(encoding="utf-8", errors="replace").splitlines():
             m = _METHOD.match(line)
             if m:
                 current = f"{module}.{m.group(1)}"
                 bodies.setdefault(current, [])
+                annotations[current] = pending
+                pending = set()
+            elif line.lstrip().startswith("@"):
+                pending |= set(_ANNOTATION.findall(line))
             elif current:
                 bodies[current].append(line)
+    return bodies, annotations
+
+
+def _closure(found: set[str], bodies: dict[str, list[str]]) -> set[str]:
+    """Добавить к набору методы, которые вызывают метод из набора, — пока набор растёт.
+    Вызов без модуля относится к своему."""
     calls: dict[str, set[str]] = {}
-    found: set[str] = set()
     for key, lines in bodies.items():
-        text = "\n".join(lines)
         own = key.split(".")[0]
-        calls[key] = {f"{q or own}.{name}" for q, name in _CALL.findall(text)}
-        if _CURRENT_USER.search(text):
-            found.add(key)
+        calls[key] = {f"{q or own}.{name}" for q, name in _CALL.findall("\n".join(lines))}
     while True:
         more = {key for key, called in calls.items() if key not in found and called & found}
         if not more:
@@ -68,12 +90,26 @@ def identity_methods(paths: list[str]) -> set[str]:
         found |= more
 
 
+def server_methods(paths: list[str]) -> set[str]:
+    """Методы, вызов которых доходит до сервера (для ПР-16), — `Модуль.Метод`.
+
+    Серверный — с `@НаСервере` и без `@НаКлиенте`; набор замыкается по вызовам: клиентский
+    метод, зовущий серверный, тоже ходит на сервер.
+    """
+    bodies, annotations = _bodies(paths)
+    found = {key for key, ann in annotations.items() if ann & _ON_SERVER and not ann & _ON_CLIENT}
+    return _closure(found, bodies)
+
+
 def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
-                sanitizers: str = "") -> list[report.Finding]:
+                sanitizers: str = "", min_period: str = "",
+                server_file: Path | None = None) -> list[report.Finding]:
     cmd = [sys.executable, "-m", "xbsl", "--data-dir", str(data_dir), "--lang", "ru",
            "--select", ",".join(rules), "--format", "json", *paths]
     env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths))),
-                              SANITIZERS_ENV: sanitizers})
+                              SANITIZERS_ENV: sanitizers,
+                              SERVER_ENV: str(server_file or ""),
+                              MIN_PERIOD_ENV: min_period})
     done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
     try:
         result = json.loads(done.stdout)
@@ -97,7 +133,10 @@ def _check(args) -> int:
         return 2
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(args.data_dir) if args.data_dir else data.build(Path(args.help_dir), Path(tmp))
-        findings = _run_engine(args.paths, data_dir, rules, args.sanitizers or "")
+        server_file = Path(tmp) / "server.txt"
+        server_file.write_text("\n".join(sorted(server_methods(args.paths))), encoding="utf-8")
+        findings = _run_engine(args.paths, data_dir, rules, args.sanitizers or "",
+                               args.min_period or "", server_file)
     report.apply_exceptions(findings, root)
     if args.perimeter:
         report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))
@@ -141,9 +180,10 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--data-dir", help="готовые данные о языке (xbsl-sonar data)")
     c.add_argument("--rules", help="правила через запятую; по умолчанию все")
     c.add_argument("--perimeter", help="перечень периметра для ПР-03: строки «путь: Ключ — причина»")
-    c.add_argument("--agreed", help="согласованные находки ПР-04: строки «путь: ПР-04 Ключ — причина»")
+    c.add_argument("--agreed", help="согласованные находки ПР-04 и ПР-16: строки «путь: ПР-NN Ключ — причина»")
     c.add_argument("--sanitizers", help="функции очистки разметки для ПР-04 через запятую; "
                                         "по умолчанию «очистить»")
+    c.add_argument("--min-period", help="порог интервала таймера для ПР-16, секунды; по умолчанию 60")
     c.add_argument("--json", help="находки файлом JSON")
     c.add_argument("--bsl-report", help="отчёт для SonarQube (формат BSL Language Server)")
     c.set_defaults(func=_check)

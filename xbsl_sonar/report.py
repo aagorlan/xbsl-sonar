@@ -18,6 +18,8 @@ MARK = re.compile(r"//\s*анализ:исключение\s+(ПР-\d+)\s+(\S+)(
 PERIMETER_MARK = re.compile(r"(?://|#)\s*анализ:периметр(?:\s+[—–-]\s*(.*))?")
 PERIMETER = "периметр"
 AGREED = "согласовано"
+# Правила, находки которых закрывает перечень согласованных (`--agreed`).
+AGREED_RULES = ("ПР-04", "ПР-16")
 
 
 @dataclass
@@ -100,10 +102,10 @@ def read_agreed(path: Path) -> set[tuple[str, str, str]]:
 
 
 def apply_agreed(findings: list[Finding], allowed: set[tuple[str, str, str]]) -> None:
-    """Находка ПР-04 из перечня согласованных — под решением владельца, не открытая.
+    """Находка ПР-04 или ПР-16 из перечня согласованных — под решением владельца, не открытая.
     Ключ — сообщение находки до первого двоеточия."""
     for f in findings:
-        if f.rule == "ПР-04" and f.debt is None:
+        if f.rule in AGREED_RULES and f.debt is None:
             key = f.message.split(":", 1)[0]
             if (f.path, f.rule, key) in allowed:
                 f.debt = AGREED

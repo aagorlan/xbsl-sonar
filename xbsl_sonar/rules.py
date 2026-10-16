@@ -158,6 +158,37 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-79",
         effort_minutes=30,
     ),
+    "ПР-16": RuleText(
+        code="ПР-16",
+        name="Таймер клиента регулярно вызывает сервер",
+        description=(
+            "<p>Повторяющийся таймер клиента ходит на сервер: каждая открытая форма "
+            "у каждого пользователя шлёт вызов раз в несколько секунд, даже когда ничего "
+            "не изменилось. Нагрузка растёт с числом открытых окон, а не с работой.</p>"
+            "<p><b>Находка:</b> <code>ПодключитьОбработчикТаймера(обработчик, интервал)</code> "
+            "без признака однократности (или с <code>Ложь</code>), интервал короче порога "
+            "(параметр <code>--min-period</code>, по умолчанию 60 с), а обработчик — "
+            "<code>&amp;Метод</code> или лямбда — вызывает серверный метод: сам или через "
+            "методы проекта. Серверный — метод с окружением <code>@НаСервере</code> "
+            "без <code>@НаКлиенте</code>; набор собирается по проверяемому коду и замыкается "
+            "по вызовам.</p>"
+            "<p><b>Не находка:</b> однократный таймер (<code>Истина</code> третьим параметром); "
+            "интервал от порога и больше; интервал, который не литерал и не "
+            "<code>Длительность.Из…(число)</code>, — его не посчитать; таймер, обработчик "
+            "которого сервер не трогает; находка из перечня согласованных "
+            "(<code>--agreed</code>: строка <code>путь: ПР-16 Ключ — причина</code>). "
+            "Вызов сервера в цикле на клиенте — ПР-15.</p>"
+            "<p><b>Как исправить:</b> проверять изменения на клиенте и идти на сервер только "
+            "по ним; реже опрашивать; отдавать серверу одну дешёвую сверку версии, а данные — "
+            "по её результату.</p>"
+            "<p>CWE-1060: Excessive Number of Inefficient Server-Side Data Accesses "
+            "(ISO/IEC 5055, производительность).</p>"
+        ),
+        type="CODE_SMELL",
+        severity="MAJOR",
+        cwe="CWE-1060",
+        effort_minutes=60,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -179,6 +210,13 @@ _RIGHT_CHECK = {"ПроверитьПраво", "ЕстьПраво", "CheckRigh
 # Методы проверяемого кода, которые читают текущего пользователя: их собирает `check`
 # до запуска движка (`identity_methods`) и передаёт сюда через окружение.
 IDENTITY_ENV = "XBSL_SONAR_IDENTITY"
+# Методы, вызов которых с клиента доходит до сервера (для ПР-16), — `Модуль.Метод` по строке;
+# набор собирает `check` до запуска движка (`server_methods`) и кладёт файлом: на большом
+# проекте он не помещается в окружение. Здесь — путь к этому файлу.
+SERVER_ENV = "XBSL_SONAR_SERVER"
+# Порог интервала таймера для ПР-16, секунды — параметр `--min-period` команды `check`.
+MIN_PERIOD_ENV = "XBSL_SONAR_MIN_PERIOD"
+DEFAULT_MIN_PERIOD = 60
 # Функции очистки разметки для ПР-04 — параметр `--sanitizers` команды `check`.
 SANITIZERS_ENV = "XBSL_SONAR_SANITIZERS"
 DEFAULT_SANITIZERS = ("очистить",)
@@ -215,7 +253,8 @@ def _server_methods(toks: list) -> set[str]:
     found: set[str] = set()
     for i, t in enumerate(toks):
         if t.kind == "KEYWORD" and t.canonical == "METHOD" and t.value[:1].islower():
-            ann = _annotations(toks, i)
+            static = i >= 1 and toks[i - 1].value in ("статический", "static")
+            ann = _annotations(toks, i - 1 if static else i)
             name = _method_name(toks, i)
             if name and ann & _SERVER and not ann & _CLIENT:
                 found.add(name)
@@ -593,3 +632,195 @@ def _resource_function(source: SourceFile, value: str) -> bool:
     except OSError:
         return False
     return _returns_resource(text, m.group(1))
+
+
+# ПР-16: повторяющийся таймер клиента с обработчиком, который доходит до сервера.
+_TIMER = {"ПодключитьОбработчикТаймера", "AttachTimerHandler"}
+_UNITS = {"мс": 0.001, "ms": 0.001, "с": 1, "s": 1, "м": 60, "m": 60, "ч": 3600, "h": 3600}
+_FROM_UNITS = {"ИзМиллисекунд": 0.001, "FromMilliseconds": 0.001, "ИзСекунд": 1,
+               "FromSeconds": 1, "ИзМинут": 60, "FromMinutes": 60, "ИзЧасов": 3600,
+               "FromHours": 3600}
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)(\D+)$")
+
+
+def _arguments(toks: list, i: int) -> tuple[list[list], int]:
+    """Аргументы вызова, у которого токен i — `(`: списки токенов по запятым верхнего уровня."""
+    args: list[list] = [[]]
+    depth = 0
+    k = i + 1
+    while k < len(toks):
+        t = toks[k]
+        if t.kind == "OP" and t.value in "([{":
+            depth += 1
+        elif t.kind == "OP" and t.value in ")]}":
+            if depth == 0:
+                return ([] if args == [[]] else args), k
+            depth -= 1
+        elif t.kind == "OP" and t.value == "," and depth == 0:
+            args.append([])
+            k += 1
+            continue
+        args[-1].append(t)
+        k += 1
+    return args, k
+
+
+def _seconds(arg: list) -> float | None:
+    """Интервал в секундах: литерал `10с`, `250мс` или `Длительность.ИзСекунд(10)`."""
+    if len(arg) == 1 and arg[0].kind == "NUMBER":
+        m = _DURATION.match(arg[0].value)
+        if m and m.group(2) in _UNITS:
+            return float(m.group(1)) * _UNITS[m.group(2)]
+        return None
+    if (len(arg) == 6 and arg[0].value in ("Длительность", "Duration") and arg[1].value == "."
+            and arg[2].value in _FROM_UNITS and arg[4].kind == "NUMBER"):
+        try:
+            return float(arg[4].value) * _FROM_UNITS[arg[2].value]
+        except ValueError:
+            return None
+    return None
+
+
+def _method_bodies(toks: list) -> dict[str, tuple[int, int]]:
+    """Методы модуля: имя → (первый, последний) индекс токенов тела."""
+    out: dict[str, tuple[int, int]] = {}
+    frames: list[tuple[str, int, str | None]] = []
+    prev = None
+    for i, t in enumerate(toks):
+        if t.kind == "KEYWORD" and t.canonical in _OPENERS and t.value[:1].islower():
+            is_else_if = (t.canonical == "IF" and prev is not None and prev.kind == "KEYWORD"
+                          and prev.canonical == "ELSE" and prev.line == t.line)
+            is_abstract = (t.canonical == "METHOD" and prev is not None and prev.kind == "KEYWORD"
+                           and prev.canonical == "ABSTRACT")
+            if not is_else_if and not is_abstract:
+                name = _method_name(toks, i) if t.canonical == "METHOD" else None
+                frames.append((t.canonical, i, name))
+        elif t.kind == "OP" and t.value == ";" and frames:
+            canonical, start, name = frames.pop()
+            if canonical == "METHOD" and name:
+                out[name] = (start, i)
+        prev = t
+    return out
+
+
+def _calls(toks: list, start: int, end: int, own: str) -> list[tuple[str, str]]:
+    """Безусловные вызовы в токенах [start, end): (ключ `Модуль.Метод`, имя метода).
+
+    Вызов в теле `если` или `выбор` — условный: так обработчик и должен идти на сервер,
+    только когда что-то сменилось. Вызов в условии `если` — безусловный: условие
+    считается на каждом срабатывании.
+    """
+    out = []
+    frames: list[tuple[str, int]] = []
+    prev = None
+    for k in range(start, end):
+        t = toks[k]
+        if t.kind == "KEYWORD" and t.canonical in _OPENERS and t.value[:1].islower():
+            is_else_if = (t.canonical == "IF" and prev is not None and prev.kind == "KEYWORD"
+                          and prev.canonical == "ELSE" and prev.line == t.line)
+            if not is_else_if:
+                frames.append((t.canonical, t.line))
+        elif t.kind == "OP" and t.value == ";" and frames:
+            frames.pop()
+        elif (t.kind == "IDENT" and k + 1 < len(toks) and toks[k + 1].value == "("
+              and not (prev is not None and prev.kind == "KEYWORD" and prev.canonical == "METHOD")
+              and not any(c in ("IF", "CASE") and t.line > line for c, line in frames)):
+            if prev is not None and prev.value in (".", "?."):
+                if k >= 2 and toks[k - 2].kind == "IDENT" and (k < 3 or toks[k - 3].value != "."):
+                    out.append((f"{toks[k - 2].value}.{t.value}", t.value))
+            else:
+                out.append((f"{own}.{t.value}", t.value))
+        prev = t
+    return out
+
+
+def _reaches_server(name: str, toks: list, bodies: dict[str, tuple[int, int]], own: str,
+                    server: set[str], local: set[str], seen: set[str]) -> str | None:
+    """Серверный метод, до которого безусловно доходит метод модуля `name`, или None."""
+    if name in local:
+        return name
+    if name in seen or name not in bodies:
+        return None
+    seen.add(name)
+    start, end = bodies[name]
+    for key, called in _calls(toks, start + 2, end, own):
+        if key.split(".")[0] == own and called in bodies:
+            found = _reaches_server(called, toks, bodies, own, server, local, seen)
+        else:
+            found = called if key in server else None
+        if found:
+            return found
+    return None
+
+
+_SERVER_SET: dict[str, frozenset[str]] = {}
+
+
+def _server_set() -> frozenset[str]:
+    path = os.environ.get(SERVER_ENV, "")
+    if path not in _SERVER_SET:
+        try:
+            with open(path, encoding="utf-8") as f:
+                _SERVER_SET[path] = frozenset(filter(None, f.read().splitlines()))
+        except OSError:
+            _SERVER_SET[path] = frozenset()
+    return _SERVER_SET[path]
+
+
+@rule("ПР-16", "Таймер клиента регулярно вызывает сервер", "D", severity=Severity.WARNING)
+def timer_to_server(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    toks = code_tokens(source)
+    if not any(t.kind == "IDENT" and t.value in _TIMER for t in toks):
+        return []
+    own = source.path.name.split(".")[0]
+    server = _server_set()
+    try:
+        limit = float(os.environ.get(MIN_PERIOD_ENV) or DEFAULT_MIN_PERIOD)
+    except ValueError:
+        limit = DEFAULT_MIN_PERIOD
+    local = _server_methods(toks)
+    bodies = _method_bodies(toks)
+    out: list[Diagnostic] = []
+    for i, t in enumerate(toks):
+        if (t.kind != "IDENT" or t.value not in _TIMER or i + 1 >= len(toks)
+                or toks[i + 1].value != "("):
+            continue
+        args, _ = _arguments(toks, i + 1)
+        if len(args) < 2:
+            continue
+        if len(args) > 2 and not (len(args[2]) == 1 and args[2][0].canonical == "FALSE"):
+            continue
+        period = _seconds(args[1])
+        if period is None or period >= limit:
+            continue
+        handler = args[0]
+        if len(handler) == 2 and handler[0].value == "&" and handler[1].kind == "IDENT":
+            name = handler[1].value
+            called = [(f"{own}.{name}", name)]
+        else:
+            arrow = next((k for k, a in enumerate(handler) if a.value == "->"), None)
+            if arrow is None:
+                continue
+            lambda_toks = handler[arrow + 1:]
+            name = next((a.value for a in lambda_toks if a.kind == "IDENT"), "лямбда")
+            called = _calls(lambda_toks, 0, len(lambda_toks), own)
+        via = None
+        for key, method in called:
+            if key.split(".")[0] == own and (method in bodies or method in local):
+                via = _reaches_server(method, toks, bodies, own, server, local, set())
+            elif key in server:
+                via = method
+            if via:
+                break
+        if via is None:
+            continue
+        shown = f"{period:g} с" if period >= 1 else f"{period * 1000:g} мс"
+        out.append(Diagnostic(
+            source.rel, t.line, t.col, "ПР-16", Severity.WARNING,
+            f"Таймер {name}: обработчик повторяется раз в {shown} и вызывает сервер "
+            f"('{via}') – каждое открытое окно шлёт вызов, даже когда ничего не изменилось. "
+            f"Проверять изменения на клиенте, реже опрашивать или сверять одну версию.",
+        ))
+    return out

@@ -2,11 +2,11 @@
 #
 #   jobs:
 #     analysis:
-#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.4.0
+#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.5.0
 #       with:
-#         version: v0.4.0
+#         version: v0.5.0
 #         perimeter: docs/периметр.txt   # для ПР-03, можно не задавать
-#         agreed: docs/согласовано.txt   # для ПР-04, можно не задавать
+#         agreed: docs/согласовано.txt   # для ПР-04 и ПР-16, можно не задавать
 #         sonar-url: ${{ vars.SONAR_URL }}
 #       secrets:
 #         sonar-token: ${{ secrets.SONAR_TOKEN }}
@@ -36,7 +36,7 @@ on:
         type: string
         default: ''
       agreed:
-        description: 'Согласованные находки ПР-04 (строки «путь: ПР-04 Ключ — причина»); пусто — без перечня'
+        description: 'Согласованные находки ПР-04 и ПР-16 (строки «путь: ПР-NN Ключ — причина»); пусто — без перечня'
         type: string
         default: ''
       sonar-url:

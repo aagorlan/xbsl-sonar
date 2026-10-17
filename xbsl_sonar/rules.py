@@ -189,6 +189,43 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-1060",
         effort_minutes=60,
     ),
+    "ПР-17": RuleText(
+        code="ПР-17",
+        name="Обращение к серверу при каждой перерисовке формы",
+        description=(
+            "<p>Форма сама решает, когда пересчитать выражения своих компонентов: при открытии, "
+            "при изменении данных, на каждую строку списка. Если выражение зовёт метод, который "
+            "идёт на сервер или в базу, каждая перерисовка — вызов сервера, а в строке списка — "
+            "по вызову на каждую строку. Так же дорог обработчик формы, который на открытии "
+            "ходит на сервер много раз подряд.</p>"
+            "<p><b>Находка:</b></p><ul>"
+            "<li>в YAML компонента — свойство-выражение (<code>Значение: =Метод()</code>, "
+            "<code>Видимость: =…</code>, <code>ЦветФона: =…</code> и любое другое с <code>=</code>), "
+            "которое вызывает метод, доходящий до сервера или базы: с окружением "
+            "<code>@НаСервере</code> без <code>@НаКлиенте</code> или с литералом "
+            "<code>Запрос{…}</code> — сам или через методы проекта (набор собирается "
+            "по проверяемому коду и замыкается по вызовам); в строке списка "
+            "(<code>ПроизвольнаяСтрокаСписка</code>) находка отмечается особо;</li>"
+            "<li>в модуле компонента — обработчик (<code>@Обработчик</code>), в теле которого "
+            "запросов и вызовов таких методов больше порога (параметр <code>--max-accesses</code>, "
+            "по умолчанию 3).</li>"
+            "</ul><p><b>Не находка:</b> выражение без вызова метода (<code>=ДанныеСтроки.Данные.Текст</code>); "
+            "<code>ЗначениеПоУмолчанию</code> свойства компонента — оно считается один раз, при создании; "
+            "метод, который считает на клиенте из уже полученных данных; обработчик с обращениями "
+            "не больше порога; находка из перечня согласованных (<code>--agreed</code>: строка "
+            "<code>путь: ПР-17 Ключ — причина</code>).</p>"
+            "<p><b>Как исправить:</b> получить данные один раз — в обработчике открытия или полем "
+            "запроса списка — и держать их в свойстве компонента; чистые вычисления (цвет "
+            "по состоянию, подпись по числу) — без окружения <code>@НаСервере</code>; несколько "
+            "вызовов обработчика — одним вызовом, отдающим структуру.</p>"
+            "<p>CWE-1073: Non-SQL Invokable Control Element with Excessive Number of Data Resource "
+            "Accesses (ISO/IEC 5055, производительность).</p>"
+        ),
+        type="CODE_SMELL",
+        severity="MAJOR",
+        cwe="CWE-1073",
+        effort_minutes=30,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -217,6 +254,13 @@ SERVER_ENV = "XBSL_SONAR_SERVER"
 # Порог интервала таймера для ПР-16, секунды — параметр `--min-period` команды `check`.
 MIN_PERIOD_ENV = "XBSL_SONAR_MIN_PERIOD"
 DEFAULT_MIN_PERIOD = 60
+# Методы, вызов которых доходит до сервера или базы (для ПР-17): серверные и с литералом
+# запроса, замкнутые по вызовам, — `Модуль.Метод` по строке; набор собирает `check`
+# (`data_methods`) и кладёт файлом. Здесь — путь к этому файлу.
+DATA_ENV = "XBSL_SONAR_DATA"
+# Порог обращений к серверу и базе в обработчике формы для ПР-17 — параметр `--max-accesses`.
+MAX_ACCESSES_ENV = "XBSL_SONAR_MAX_ACCESSES"
+DEFAULT_MAX_ACCESSES = 3
 # Функции очистки разметки для ПР-04 — параметр `--sanitizers` команды `check`.
 SANITIZERS_ENV = "XBSL_SONAR_SANITIZERS"
 DEFAULT_SANITIZERS = ("очистить",)
@@ -823,4 +867,107 @@ def timer_to_server(source: SourceFile) -> Iterable[Diagnostic]:
             f"('{via}') – каждое открытое окно шлёт вызов, даже когда ничего не изменилось. "
             f"Проверять изменения на клиенте, реже опрашивать или сверять одну версию.",
         ))
+    return out
+
+
+# ПР-17: метод, который форма считает при каждой перерисовке, доходит до сервера или базы;
+# обработчик формы с числом обращений больше порога.
+_YAML_EXPRESSION = re.compile(r"^(\s*)(?:-\s+)?([^\s:#'\"][^:#]*?):\s*(['\"]?)=(.*?)\3?\s*$")
+_EXPRESSION_CALL = re.compile(r"(?<![\w.])(?:(\w+)\s*\.\s*)?(\w+)\s*\(")
+_YAML_COMPONENT = re.compile(r"^(ВидЭлемента|ElementKind):\s*(КомпонентИнтерфейса|InterfaceComponent)\s*$",
+                             re.MULTILINE)
+_LIST_ROW = re.compile(r"ПроизвольнаяСтрокаСписка|CustomListRow")
+_HANDLER = {"Обработчик", "Handler"}
+# Значение по умолчанию свойства компонента считается один раз, при создании, а не на перерисовке
+_ONCE = {"ЗначениеПоУмолчанию", "DefaultValue"}
+
+_DATA_SET: dict[str, frozenset[str]] = {}
+
+
+def _data_set() -> frozenset[str]:
+    path = os.environ.get(DATA_ENV, "")
+    if path not in _DATA_SET:
+        try:
+            with open(path, encoding="utf-8") as f:
+                _DATA_SET[path] = frozenset(filter(None, f.read().splitlines()))
+        except OSError:
+            _DATA_SET[path] = frozenset()
+    return _DATA_SET[path]
+
+
+def _pair_component(source: SourceFile) -> bool:
+    pair = source.path.with_name(source.path.name.split(".")[0] + ".yaml")
+    try:
+        return bool(_YAML_COMPONENT.search(pair.read_text(encoding="utf-8-sig")))
+    except OSError:
+        return False
+
+
+def _accesses(toks: list, start: int, end: int, own: str, data_set: frozenset[str]) -> int:
+    """Запросы и вызовы методов, доходящих до сервера или базы, в токенах [start, end)."""
+    count = 0
+    prev = None
+    for k in range(start, end):
+        t = toks[k]
+        if t.kind == "KEYWORD" and t.canonical == "QUERY":
+            count += 1
+        elif (t.kind == "IDENT" and k + 1 < len(toks) and toks[k + 1].value == "("
+              and not (prev is not None and prev.kind == "KEYWORD" and prev.canonical == "METHOD")):
+            if prev is not None and prev.value in (".", "?."):
+                if k >= 2 and toks[k - 2].kind == "IDENT" and (k < 3 or toks[k - 3].value != "."):
+                    count += f"{toks[k - 2].value}.{t.value}" in data_set
+            else:
+                count += f"{own}.{t.value}" in data_set
+        prev = t
+    return count
+
+
+@rule("ПР-17", "Обращение к серверу при каждой перерисовке формы", "D", severity=Severity.WARNING)
+def redraw_data_access(source: SourceFile) -> Iterable[Diagnostic]:
+    data_set = _data_set()
+    own = source.path.name.split(".")[0]
+    out: list[Diagnostic] = []
+    if source.kind == "yaml":
+        if not _YAML_COMPONENT.search(source.text):
+            return []
+        row = bool(_LIST_ROW.search(source.text))
+        for n, line in enumerate(source.text.splitlines(), 1):
+            m = _YAML_EXPRESSION.match(line)
+            if not m:
+                continue
+            prop = m.group(2).strip()
+            if prop in _ONCE:
+                continue
+            for call in _EXPRESSION_CALL.finditer(m.group(4)):
+                module, name = call.group(1), call.group(2)
+                key = f"{module or own}.{name}"
+                if key not in data_set:
+                    continue
+                where = ("строка списка считает его на каждую строку при каждой перерисовке"
+                         if row else "форма считает его при каждой перерисовке")
+                out.append(Diagnostic(
+                    source.rel, n, line.find(prop) + 1, "ПР-17", Severity.WARNING,
+                    f"Выражение {prop} ={name}(): {where}, а метод '{key}' идёт на сервер "
+                    f"или в базу. Получить данные один раз и держать в свойстве компонента "
+                    f"или считать на клиенте.",
+                ))
+                break
+    elif source.kind == "xbsl" and _pair_component(source):
+        try:
+            limit = int(os.environ.get(MAX_ACCESSES_ENV) or DEFAULT_MAX_ACCESSES)
+        except ValueError:
+            limit = DEFAULT_MAX_ACCESSES
+        toks = code_tokens(source)
+        for name, (start, end) in _method_bodies(toks).items():
+            static = start >= 1 and toks[start - 1].value in ("статический", "static")
+            if not _annotations(toks, start - 1 if static else start) & _HANDLER:
+                continue
+            count = _accesses(toks, start + 2, end, own, data_set)
+            if count > limit:
+                out.append(Diagnostic(
+                    source.rel, toks[start].line, toks[start].col, "ПР-17", Severity.WARNING,
+                    f"Обработчик {name}: {count} обращений к серверу и базе подряд (порог {limit}) – "
+                    f"каждое отдельным вызовом. Собрать данные одним серверным методом, "
+                    f"отдающим структуру.",
+                ))
     return out

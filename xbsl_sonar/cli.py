@@ -1,7 +1,7 @@
 """Командная строка xbsl-sonar.
 
     xbsl-sonar check IT --help-dir docs/vendor [--perimeter периметр.txt] [--sanitizers очистить]
-                    [--agreed согласовано.txt]
+                    [--agreed согласовано.txt] [--min-period 60] [--max-accesses 3]
                     [--bsl-report отчёт.json]
                     [--json находки.json]
     xbsl-sonar data --help-dir docs/vendor --out каталог
@@ -22,10 +22,12 @@ import tempfile
 from pathlib import Path
 
 from xbsl_sonar import __version__, data, report
-from xbsl_sonar.rules import IDENTITY_ENV, MIN_PERIOD_ENV, RULE_IDS, SANITIZERS_ENV, SERVER_ENV
+from xbsl_sonar.rules import (DATA_ENV, IDENTITY_ENV, MAX_ACCESSES_ENV, MIN_PERIOD_ENV, RULE_IDS,
+                               SANITIZERS_ENV, SERVER_ENV)
 
 _METHOD = re.compile(r"^\s*(?:статический\s+|static\s+)?(?:метод|method)\s+(\w+)", re.IGNORECASE)
 _CURRENT_USER = re.compile(r"\b(?:ТекущийПользователь|CurrentUser)\b")
+_QUERY = re.compile(r"(?<![\w.])(?:Запрос|Query)\s*\{")
 
 
 _CALL = re.compile(r"(?<![\w.])(?:(\w+)\s*\.\s*)?(\w+)\s*\(")
@@ -101,15 +103,29 @@ def server_methods(paths: list[str]) -> set[str]:
     return _closure(found, bodies)
 
 
+def data_methods(paths: list[str]) -> set[str]:
+    """Методы, вызов которых доходит до сервера или базы (для ПР-17), — `Модуль.Метод`.
+
+    Серверные (как для ПР-16) и методы с литералом `Запрос{…}`; набор замыкается по вызовам.
+    """
+    bodies, annotations = _bodies(paths)
+    found = {key for key, ann in annotations.items() if ann & _ON_SERVER and not ann & _ON_CLIENT}
+    found |= {key for key, lines in bodies.items() if _QUERY.search("\n".join(lines))}
+    return _closure(found, bodies)
+
+
 def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                 sanitizers: str = "", min_period: str = "",
-                server_file: Path | None = None) -> list[report.Finding]:
+                server_file: Path | None = None, data_file: Path | None = None,
+                max_accesses: str = "") -> list[report.Finding]:
     cmd = [sys.executable, "-m", "xbsl", "--data-dir", str(data_dir), "--lang", "ru",
            "--select", ",".join(rules), "--format", "json", *paths]
     env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths))),
                               SANITIZERS_ENV: sanitizers,
                               SERVER_ENV: str(server_file or ""),
-                              MIN_PERIOD_ENV: min_period})
+                              DATA_ENV: str(data_file or ""),
+                              MIN_PERIOD_ENV: min_period,
+                              MAX_ACCESSES_ENV: max_accesses})
     done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
     try:
         result = json.loads(done.stdout)
@@ -135,8 +151,11 @@ def _check(args) -> int:
         data_dir = Path(args.data_dir) if args.data_dir else data.build(Path(args.help_dir), Path(tmp))
         server_file = Path(tmp) / "server.txt"
         server_file.write_text("\n".join(sorted(server_methods(args.paths))), encoding="utf-8")
+        data_file = Path(tmp) / "data.txt"
+        data_file.write_text("\n".join(sorted(data_methods(args.paths))), encoding="utf-8")
         findings = _run_engine(args.paths, data_dir, rules, args.sanitizers or "",
-                               args.min_period or "", server_file)
+                               args.min_period or "", server_file, data_file,
+                               args.max_accesses or "")
     report.apply_exceptions(findings, root)
     if args.perimeter:
         report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))
@@ -180,10 +199,13 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--data-dir", help="готовые данные о языке (xbsl-sonar data)")
     c.add_argument("--rules", help="правила через запятую; по умолчанию все")
     c.add_argument("--perimeter", help="перечень периметра для ПР-03: строки «путь: Ключ — причина»")
-    c.add_argument("--agreed", help="согласованные находки ПР-04 и ПР-16: строки «путь: ПР-NN Ключ — причина»")
+    c.add_argument("--agreed", help="согласованные находки ПР-04, ПР-16 и ПР-17: "
+                                    "строки «путь: ПР-NN Ключ — причина»")
     c.add_argument("--sanitizers", help="функции очистки разметки для ПР-04 через запятую; "
                                         "по умолчанию «очистить»")
     c.add_argument("--min-period", help="порог интервала таймера для ПР-16, секунды; по умолчанию 60")
+    c.add_argument("--max-accesses", help="порог обращений к серверу и базе в обработчике формы "
+                                          "для ПР-17; по умолчанию 3")
     c.add_argument("--json", help="находки файлом JSON")
     c.add_argument("--bsl-report", help="отчёт для SonarQube (формат BSL Language Server)")
     c.set_defaults(func=_check)

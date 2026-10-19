@@ -226,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--data-dir", help="готовые данные о языке (xbsl-sonar data)")
     c.add_argument("--rules", help="правила через запятую; по умолчанию все")
     c.add_argument("--perimeter", help="перечень периметра для ПР-03: строки «путь: Ключ — причина»")
-    c.add_argument("--agreed", help="согласованные находки ПР-02, ПР-04, ПР-16 и ПР-17: "
+    c.add_argument("--agreed", help="согласованные находки ПР-02, ПР-04, ПР-05, ПР-16 и ПР-17: "
                                     "строки «путь: ПР-NN Ключ — причина»")
     c.add_argument("--sanitizers", help="функции очистки разметки для ПР-04 через запятую; "
                                         "по умолчанию «очистить»")

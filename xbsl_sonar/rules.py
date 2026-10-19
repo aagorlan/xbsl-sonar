@@ -203,6 +203,45 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-79",
         effort_minutes=30,
     ),
+    "ПР-05": RuleText(
+        code="ПР-05",
+        name="Повышение прав с клиента без сверки",
+        description=(
+            "<p>Метод, доступный с клиента, открывает привилегированный контекст и ни разу "
+            "не сверяется с тем, кто его вызвал. Вызвать такой метод может любой вошедший: "
+            "вызовы серверных методов собирает браузер. В повышенных правах метод читает "
+            "и пишет всё, что угодно, — права объектов отключены, а проверить, кому он это "
+            "отдаёт, некому.</p>"
+            "<p><b>Находка:</b></p><ul>"
+            "<li>метод <code>@НаСервере @ДоступноСКлиента</code> без параметров-ссылок открывает "
+            "<code>КонтекстДоступа.Привилегированный()</code> или "
+            "<code>ГрупповаяОперация.Начать(…, ПривилегированныйРежим = Истина)</code>, "
+            "а сверки с текущим пользователем нет. Сверка — как в ПР-01: вызов метода, "
+            "читающего текущего пользователя (набор собирается по проверяемому коду "
+            "и замыкается по вызовам: <code>ЭтоАдминистратор()</code>, "
+            "<code>ПолучитьУчастника()</code>, <code>ПроверитьПрава()</code>…), "
+            "<code>ТекущийПользователь</code> в условии <code>если</code> или "
+            "<code>КонтрольДоступа.ПроверитьПраво</code>/<code>ЕстьПраво</code> до повышения прав;</li>"
+            "<li>привилегированный контекст, который переживает строку открытия: "
+            "<code>КонтекстДоступа.Привилегированный()</code> не в инструкции <code>исп</code> — "
+            "присвоен, возвращён, передан аргументом — в любом методе.</li></ul>"
+            "<p><b>Не находка:</b> метод с параметром-ссылкой — его проверяет ПР-01; серверный "
+            "метод без доступа с клиента — его видимость задаёт вызывающий; "
+            "<code>исп</code> с именем (<code>исп П = КонтекстДоступа.Привилегированный()</code>) — "
+            "контекст закрывается вместе с блоком; находка из перечня согласованных "
+            "(<code>--agreed</code>: строка <code>путь: ПР-05 Ключ — причина</code>).</p>"
+            "<p><b>Как исправить:</b> проверить права вызывающего первой строкой метода "
+            "(администратор — отказ исключением, участник — брать его на сервере); "
+            "если повышение не нужно — убрать его; не отдавать на клиент того, что "
+            "прочитано в повышенных правах, — секретов, чужих данных.</p>"
+            "<p>CWE-269: Improper Privilege Management (OWASP A01:2021 Broken Access Control; "
+            "A04:2021 Insecure Design).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="CRITICAL",
+        cwe="CWE-269",
+        effort_minutes=30,
+    ),
     "ПР-16": RuleText(
         code="ПР-16",
         name="Таймер клиента регулярно вызывает сервер",
@@ -524,6 +563,99 @@ def reference_from_client(source: SourceFile) -> Iterable[Diagnostic]:
                 module = toks[i - 2].value if qualified else own
                 if f"{module}.{t.value}" in identity:
                     method[5] = True
+        prev = t
+    return out
+
+
+# ПР-05: повышение прав на границе клиента. Метод с параметром-ссылкой — забота ПР-01;
+# здесь — остальные методы с доступом с клиента и контекст, открытый не инструкцией `исп`.
+_USE = {"исп", "use"}
+_GROUP_PRIVILEGED = {"ПривилегированныйРежим", "PrivilegedMode"}
+_TRUE = {"Истина", "True"}
+
+
+def _privileged_at(toks: list, i: int) -> bool:
+    """Токен i открывает привилегированный контекст: `Привилегированный(` или
+    `ПривилегированныйРежим = Истина` в аргументах (`ГрупповаяОперация.Начать`)."""
+    t = toks[i]
+    if t.value in _PRIVILEGED:
+        return i + 1 < len(toks) and toks[i + 1].value == "("
+    return (t.value in _GROUP_PRIVILEGED and i + 2 < len(toks) and toks[i + 1].value == "="
+            and toks[i + 2].value in _TRUE)
+
+
+def _line_start(toks: list, i: int) -> int:
+    k = i
+    while k > 0 and toks[k - 1].line == toks[i].line:
+        k -= 1
+    return k
+
+
+@rule("ПР-05", "Повышение прав с клиента без сверки", "S", severity=Severity.WARNING)
+def privileged_from_client(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    identity = set(filter(None, os.environ.get(IDENTITY_ENV, "").split(",")))
+    own = source.path.name.split(".")[0]
+    toks = code_tokens(source)
+    out: list[Diagnostic] = []
+    frames: list[str] = []
+    method = None  # [имя, строка, глубина, привилегии, сверка, с клиента]
+    condition = -1
+    prev = None
+    for i, t in enumerate(toks):
+        if t.kind == "KEYWORD" and t.canonical in _OPENERS and t.value[:1].islower():
+            is_else_if = (t.canonical == "IF" and prev is not None and prev.kind == "KEYWORD"
+                          and prev.canonical == "ELSE" and prev.line == t.line)
+            is_abstract = (t.canonical == "METHOD" and prev is not None and prev.kind == "KEYWORD"
+                           and prev.canonical == "ABSTRACT")
+            if t.canonical == "IF":
+                condition = t.line
+            if not is_else_if and not is_abstract:
+                frames.append(t.canonical)
+                if t.canonical == "METHOD":
+                    static = prev is not None and prev.value in ("статический", "static")
+                    ann = _annotations(toks, i - 1 if static else i)
+                    client = bool(ann & _SERVER and ann & _FROM_CLIENT) and not _reference_params(toks, i)
+                    method = [_method_name(toks, i), t.line, len(frames), False, False, client]
+        elif t.kind == "OP" and t.value == ";":
+            if frames:
+                if method is not None and len(frames) == method[2]:
+                    name, line, _, privileged, checked, client = method
+                    if client and privileged and not checked:
+                        out.append(Diagnostic(
+                            source.rel, line, 1, "ПР-05", Severity.WARNING,
+                            f"Повышение прав {name}: метод доступен с клиента и открывает "
+                            f"привилегированный контекст без сверки с текущим пользователем — "
+                            f"вызвать его может любой вошедший. Проверить права вызывающего "
+                            f"до повышения или не повышать права.",
+                        ))
+                    method = None
+                frames.pop()
+        elif t.kind == "IDENT":
+            if _privileged_at(toks, i):
+                if method is not None:
+                    method[3] = True
+                start = _line_start(toks, i)
+                if t.value in _PRIVILEGED and toks[start].value.lower() not in _USE:
+                    out.append(Diagnostic(
+                        source.rel, t.line, t.col, "ПР-05", Severity.WARNING,
+                        f"Контекст {t.value}: привилегированный контекст открыт не инструкцией "
+                        f"«исп» и переживает строку — повышение прав шире блока. Открывать "
+                        f"через «исп» в том методе, где оно нужно.",
+                    ))
+            elif method is not None:
+                if t.value in _RIGHT_CHECK and not method[3]:
+                    method[4] = True
+                elif t.value in _CURRENT_USER and t.line == condition:
+                    method[4] = True
+                elif i + 1 < len(toks) and toks[i + 1].value == "(" and not (
+                        prev is not None and prev.kind == "KEYWORD" and prev.canonical == "METHOD"):
+                    qualified = (prev is not None and prev.value == "." and i >= 2
+                                 and toks[i - 2].kind == "IDENT")
+                    module = toks[i - 2].value if qualified else own
+                    if f"{module}.{t.value}" in identity:
+                        method[4] = True
         prev = t
     return out
 

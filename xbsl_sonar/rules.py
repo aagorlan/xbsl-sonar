@@ -65,6 +65,51 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-639",
         effort_minutes=30,
     ),
+    "ПР-02": RuleText(
+        code="ПР-02",
+        name="Действие администратора без проверки на сервере",
+        description=(
+            "<p>Элемент формы, который интерфейс показывает только администратору, — права "
+            "проверены одной видимостью. Видимость решает клиент: данные формы и вызовы "
+            "серверных методов собирает браузер, и пользователь без прав может их подставить. "
+            "Если за таким элементом стоит запись данных без своей проверки на сервере, "
+            "сделать её может любой вошедший.</p>"
+            "<p><b>Находка:</b> в YAML компонента элемент с <code>Видимость</code> или "
+            "<code>Доступность</code>, выражение которых говорит об администраторе "
+            "(<code>=ДанныеПользователя.Администратор</code>, <code>=Администратор</code>, "
+            "<code>ЭтоАдминистратор()</code>), и внутри него:</p><ul>"
+            "<li>обработчик (<code>ПриНажатии</code>, <code>ПриИзменении</code>, "
+            "<code>Обработчик</code>…), который сам или через методы модуля формы вызывает "
+            "метод <code>@НаСервере @ДоступноСКлиента</code>, который пишет данные "
+            "(<code>Записать</code>, <code>Удалить</code>) в привилегированном контексте — сам "
+            "или через вызываемые — без сверки с текущим пользователем ни в нём, ни в вызываемых; "
+            "без повышения прав действуют права объекта, их проверяет платформа;</li>"
+            "<li>поле, привязанное к реквизиту объекта формы (<code>Значение: =Объект.Реквизит</code>), "
+            "если менять объект вправе не только администратор (право <code>Изменение</code> "
+            "или <code>ПоУмолчанию</code> указано и не <code>РазрешеноАдминистраторам</code>), "
+            "а <code>ПередЗаписью</code> модуля объекта не сверяет этот реквизит "
+            "с текущим пользователем: объект пишется стандартной командой формы, и значение "
+            "приходит из данных формы.</li></ul>"
+            "<p>Сверка — как в ПР-01: вызов метода, читающего текущего пользователя (набор "
+            "собирается по проверяемому коду и замыкается по вызовам: <code>ЭтоАдминистратор()</code>, "
+            "<code>ПроверитьПрава()</code>…), или <code>КонтрольДоступа.ПроверитьПраво</code>/"
+            "<code>ЕстьПраво</code>.</p>"
+            "<p><b>Не находка:</b> серверный метод, который сам или через вызываемые проверяет "
+            "права; элемент, видимый не только администратору; поле, чей реквизит сверяется "
+            "в <code>ПередЗаписью</code>; форма, открытая из такого элемента, — её методы "
+            "проверяет ПР-01; находка из перечня согласованных (<code>--agreed</code>: строка "
+            "<code>путь: ПР-02 Ключ — причина</code>).</p>"
+            "<p><b>Как исправить:</b> проверить администратора в самом серверном методе "
+            "(первой строкой, отказ исключением) или в <code>ПередЗаписью</code> объекта для "
+            "реквизита, который ставит только администратор.</p>"
+            "<p>CWE-285: Improper Authorization; CWE-424: Improper Protection of Alternate Path "
+            "(OWASP A01:2021 Broken Access Control).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="CRITICAL",
+        cwe="CWE-285",
+        effort_minutes=30,
+    ),
     "ПР-15": RuleText(
         code="ПР-15",
         name="Обращение к данным в цикле",
@@ -258,6 +303,10 @@ DEFAULT_MIN_PERIOD = 60
 # запроса, замкнутые по вызовам, — `Модуль.Метод` по строке; набор собирает `check`
 # (`data_methods`) и кладёт файлом. Здесь — путь к этому файлу.
 DATA_ENV = "XBSL_SONAR_DATA"
+# Методы с доступом с клиента, которые пишут данные без сверки с текущим пользователем
+# (для ПР-02), — `Модуль.Метод` по строке; набор собирает `check` (`unguarded_methods`)
+# и кладёт файлом. Здесь — путь к этому файлу.
+UNGUARDED_ENV = "XBSL_SONAR_UNGUARDED"
 # Порог обращений к серверу и базе в обработчике формы для ПР-17 — параметр `--max-accesses`.
 MAX_ACCESSES_ENV = "XBSL_SONAR_MAX_ACCESSES"
 DEFAULT_MAX_ACCESSES = 3
@@ -970,4 +1019,203 @@ def redraw_data_access(source: SourceFile) -> Iterable[Diagnostic]:
                     f"каждое отдельным вызовом. Собрать данные одним серверным методом, "
                     f"отдающим структуру.",
                 ))
+    return out
+
+
+# ПР-02: элемент, видимый только администратору, а за ним — запись данных без проверки на сервере.
+_ADMIN_SWITCH = re.compile(
+    r"^(\s*)(-\s+)?(Видимость|Доступность|Visible|Enabled):\s*(['\"]?)=(.*Администратор.*?)\4?\s*$")
+_YAML_HANDLER = re.compile(r"^\s*(?:-\s+)?(При\w+|Обработчик|On\w+|Handler):\s*(\w+)\s*$")
+_YAML_FIELD = re.compile(
+    r"^\s*(?:-\s+)?(?:Значение|Value):\s*(['\"]?)=\s*(?:Объект|Запись|Object|Record)\.(\w+)\s*\1\s*$")
+_YAML_NAME = re.compile(r"^\s*(?:-\s+)?(?:Имя|Name):\s*(\S+)\s*$")
+_FORM_OF = re.compile(r"(?:ФормаОбъекта|ФормаЗаписи|ObjectForm|RecordForm)<(\w+)\.")
+_TEXT_METHOD = re.compile(r"^\s*(?:статический\s+|static\s+)?(?:метод|method)\s+(\w+)", re.IGNORECASE)
+_TEXT_CALL = re.compile(r"(?<![\w.])(?:(\w+)\s*\.\s*)?(\w+)\s*\(")
+_BEFORE_WRITE = {"ПередЗаписью", "BeforeWrite"}
+
+_UNGUARDED_SET: dict[str, frozenset[str]] = {}
+
+
+def _unguarded_set() -> frozenset[str]:
+    path = os.environ.get(UNGUARDED_ENV, "")
+    if path not in _UNGUARDED_SET:
+        try:
+            with open(path, encoding="utf-8") as f:
+                _UNGUARDED_SET[path] = frozenset(filter(None, f.read().splitlines()))
+        except OSError:
+            _UNGUARDED_SET[path] = frozenset()
+    return _UNGUARDED_SET[path]
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _element_span(lines: list[str], n: int, ind: int) -> tuple[int, int]:
+    """Строки [начало, конец) отображения YAML, ключи которого стоят с отступом ind
+    и которому принадлежит строка n."""
+    start = n
+    while start > 0 and (not lines[start - 1].strip() or _indent(lines[start - 1]) >= ind):
+        start -= 1
+    if start > 0 and lines[start - 1].lstrip().startswith("- ") and _indent(lines[start - 1]) == ind - 2:
+        start -= 1
+    end = n + 1
+    while end < len(lines) and (not lines[end].strip() or (_indent(lines[end]) >= ind
+                                and not (_indent(lines[end]) == ind - 2
+                                         and lines[end].lstrip().startswith("-")))):
+        end += 1
+    return start, end
+
+
+def _text_bodies(text: str, server: set[str] | None = None) -> dict[str, str]:
+    """Методы модуля по строкам: имя → тело (от заголовка до следующего метода).
+    В `server`, если передан, складываются серверные: `@НаСервере` без `@НаКлиенте`."""
+    out: dict[str, list[str]] = {}
+    current = None
+    pending: set[str] = set()
+    for line in text.splitlines():
+        m = _TEXT_METHOD.match(line)
+        if m:
+            current = m.group(1)
+            out[current] = []
+            if server is not None and pending & _SERVER and not pending & _CLIENT:
+                server.add(current)
+            pending = set()
+        elif line.lstrip().startswith("@"):
+            pending |= set(re.findall(r"@(\w+)", line))
+        elif current:
+            out[current].append(line)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+def _reaches_unguarded(name: str, bodies: dict[str, str], own: str, unguarded: frozenset[str],
+                       server: set[str], seen: set[str]) -> str | None:
+    """Метод с доступом с клиента без сверки, до которого доходит метод модуля `name`.
+    Серверный метод — граница: дальше вызовы идут на сервере, и проверка в нём их покрывает."""
+    if f"{own}.{name}" in unguarded:
+        return f"{own}.{name}"
+    if name in seen or name not in bodies:
+        return None
+    seen.add(name)
+    for module, called in _TEXT_CALL.findall(bodies[name]):
+        key = f"{module or own}.{called}"
+        if key in unguarded:
+            return key
+        if not module and called in bodies and called not in server:
+            found = _reaches_unguarded(called, bodies, own, unguarded, server, seen)
+            if found:
+                return found
+    return None
+
+
+def _read_pair(path, suffix: str) -> str | None:
+    try:
+        return path.with_name(path.name.split(".")[0] + suffix).read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+
+
+_RIGHT_LINE = re.compile(r"^\s*(Изменение|ПоУмолчанию|Update|Default):\s*(\w+)\s*$", re.MULTILINE)
+_ADMINS_ONLY = {"РазрешеноАдминистраторам", "AllowedToAdministrators"}
+
+
+def _editable_by_others(yaml_text: str) -> bool:
+    """Право изменения объекта указано и не ограничено администраторами: `Изменение`,
+    а без него — `ПоУмолчанию`. Не указано вовсе — не знаем, считаем закрытым."""
+    rights = dict(_RIGHT_LINE.findall(yaml_text))
+    value = rights.get("Изменение") or rights.get("Update") or rights.get("ПоУмолчанию") \
+        or rights.get("Default")
+    return value is not None and value not in _ADMINS_ONLY
+
+
+def _object_module(source: SourceFile) -> tuple[str, str] | None:
+    """Модуль объекта формы (`Тип.Объект.xbsl`, `Тип.НаборЗаписей.xbsl`) рядом с формой
+    или уровнем выше: (имя типа, текст), если объект вправе менять не только администратор
+    (по `Тип.yaml` там же)."""
+    m = _FORM_OF.search(source.text)
+    if not m:
+        return None
+    for folder in (source.path.parent, source.path.parent.parent):
+        for suffix in (".Объект.xbsl", ".НаборЗаписей.xbsl"):
+            try:
+                text = (folder / (m.group(1) + suffix)).read_text(encoding="utf-8-sig")
+                described = (folder / (m.group(1) + ".yaml")).read_text(encoding="utf-8-sig")
+            except OSError:
+                continue
+            return (m.group(1), text) if _editable_by_others(described) else None
+    return None
+
+
+def _field_checked(module: tuple[str, str], field: str, identity: set[str]) -> bool:
+    """`ПередЗаписью` модуля объекта упоминает реквизит и сверяется с текущим пользователем."""
+    own, text = module
+    body = next((b for name, b in _text_bodies(text).items() if name in _BEFORE_WRITE), "")
+    if not re.search(rf"(?<![\w]){re.escape(field)}(?![\w])", body):
+        return False
+    for q, name in _TEXT_CALL.findall(body):
+        if name in _RIGHT_CHECK or f"{q or own}.{name}" in identity:
+            return True
+    return False
+
+
+@rule("ПР-02", "Действие администратора без проверки на сервере", "S", severity=Severity.WARNING)
+def admin_only_in_interface(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "yaml" or not _YAML_COMPONENT.search(source.text):
+        return []
+    lines = source.text.splitlines()
+    switches = [(n, m) for n, line in enumerate(lines) if (m := _ADMIN_SWITCH.match(line))]
+    if not switches:
+        return []
+    own = source.path.name.split(".")[0]
+    unguarded = _unguarded_set()
+    identity = set(filter(None, os.environ.get(IDENTITY_ENV, "").split(",")))
+    pair = _read_pair(source.path, ".xbsl")
+    server: set[str] = set()
+    bodies = _text_bodies(pair, server) if pair is not None else {}
+    module = None
+    out: list[Diagnostic] = []
+    reported: set[int] = set()
+    for n, m in switches:
+        ind = len(m.group(1)) + (2 if m.group(2) else 0)
+        start, end = _element_span(lines, n, ind)
+        names = [nm.group(1) for k in range(start, end)
+                 if _indent(lines[k]) <= ind and (nm := _YAML_NAME.match(lines[k]))]
+        key = f"{m.group(3)} {names[0] if names else own}"
+        fields: list[tuple[int, str]] = []
+        for k in range(start, end):
+            if k in reported:
+                continue
+            h = _YAML_HANDLER.match(lines[k])
+            if h:
+                via = _reaches_unguarded(h.group(2), bodies, own, unguarded, server, set())
+                if via:
+                    reported.add(k)
+                    out.append(Diagnostic(
+                        source.rel, k + 1, _indent(lines[k]) + 1, "ПР-02", Severity.WARNING,
+                        f"{key}: элемент виден только администратору, а {h.group(1)} "
+                        f"{h.group(2)} доходит до '{via}' — метод с доступом с клиента пишет "
+                        f"в повышенных правах без проверки текущего пользователя. Видимость решает "
+                        f"клиент: проверить права в самом серверном методе.",
+                    ))
+                continue
+            f = _YAML_FIELD.match(lines[k])
+            if f:
+                if module is None:
+                    module = _object_module(source) or ("", "")
+                if module[0] and not _field_checked(module, f.group(2), identity):
+                    reported.add(k)
+                    fields.append((k, f.group(2)))
+        if fields:
+            k = fields[0][0]
+            names = ", ".join(name for _, name in fields)
+            out.append(Diagnostic(
+                source.rel, k + 1, _indent(lines[k]) + 1, "ПР-02", Severity.WARNING,
+                f"{key}: {'поле' if len(fields) == 1 else 'поля'} {names} "
+                f"{'видно' if len(fields) == 1 else 'видны'} только администратору, а "
+                f"'{module[0]}.ПередЗаписью' не {'сверяет его' if len(fields) == 1 else 'сверяет их'} "
+                f"с текущим пользователем — значение приходит из данных формы с клиента. "
+                f"Проверить в ПередЗаписью, что {'его' if len(fields) == 1 else 'их'} меняет "
+                f"администратор.",
+            ))
     return out

@@ -2,9 +2,9 @@
 #
 #   jobs:
 #     analysis:
-#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.6.0
+#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.7.0
 #       with:
-#         version: v0.6.0
+#         version: v0.7.0
 #         perimeter: docs/периметр.txt   # для ПР-03, можно не задавать
 #         agreed: docs/согласовано.txt   # для ПР-04 и ПР-16, можно не задавать
 #         sonar-url: ${{ vars.SONAR_URL }}
@@ -36,7 +36,7 @@ on:
         type: string
         default: ''
       agreed:
-        description: 'Согласованные находки ПР-04, ПР-16 и ПР-17 (строки «путь: ПР-NN Ключ — причина»); пусто — без перечня'
+        description: 'Согласованные находки ПР-02, ПР-04, ПР-16 и ПР-17 (строки «путь: ПР-NN Ключ — причина»); пусто — без перечня'
         type: string
         default: ''
       sonar-url:

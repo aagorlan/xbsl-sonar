@@ -23,7 +23,7 @@ from pathlib import Path
 
 from xbsl_sonar import __version__, data, report
 from xbsl_sonar.rules import (DATA_ENV, IDENTITY_ENV, MAX_ACCESSES_ENV, MIN_PERIOD_ENV, RULE_IDS,
-                               SANITIZERS_ENV, SERVER_ENV)
+                               SANITIZERS_ENV, SERVER_ENV, UNGUARDED_ENV)
 
 _METHOD = re.compile(r"^\s*(?:статический\s+|static\s+)?(?:метод|method)\s+(\w+)", re.IGNORECASE)
 _CURRENT_USER = re.compile(r"\b(?:ТекущийПользователь|CurrentUser)\b")
@@ -34,6 +34,10 @@ _CALL = re.compile(r"(?<![\w.])(?:(\w+)\s*\.\s*)?(\w+)\s*\(")
 _ANNOTATION = re.compile(r"@(\w+)")
 _ON_SERVER = {"НаСервере", "OnServer"}
 _ON_CLIENT = {"НаКлиенте", "OnClient"}
+_FROM_CLIENT = {"ДоступноСКлиента", "AvailableFromClient"}
+_PRIVILEGED = re.compile(r"(?<![\w])(?:Привилегированный|Privileged)\s*\(")
+_WRITE = re.compile(r"\.(?:Записать|Удалить|УстановитьПометкуУдаления|Write|Delete|SetDeletionMark)\s*\(")
+_RIGHT_CHECK = re.compile(r"(?<![\w])(?:ПроверитьПраво|ЕстьПраво|CheckRight|HasRight)\s*\(")
 
 
 def identity_methods(paths: list[str]) -> set[str]:
@@ -114,16 +118,37 @@ def data_methods(paths: list[str]) -> set[str]:
     return _closure(found, bodies)
 
 
+def unguarded_methods(paths: list[str]) -> set[str]:
+    """Методы с доступом с клиента, которые работают в повышенных правах без сверки (для ПР-02),
+    — `Модуль.Метод`.
+
+    Запись в повышенных правах — метод, где есть и привилегированный контекст, и `Записать(`/
+    `Удалить(`; набор замыкается по вызовам. Без повышения прав действуют права объекта, и их
+    проверяет платформа; повышение без записи (пересчёт ключей, чтение) тоже не находка. Сверка — как
+    в ПР-01: метод из набора `identity_methods` или проверка права (`ПроверитьПраво`/`ЕстьПраво`),
+    сама или в вызываемых.
+    """
+    bodies, annotations = _bodies(paths)
+    writers = _closure({k for k, lines in bodies.items()
+                        if _PRIVILEGED.search(text := "\n".join(lines)) and _WRITE.search(text)}, bodies)
+    checked = identity_methods(paths)
+    checked |= {k for k, lines in bodies.items() if _RIGHT_CHECK.search("\n".join(lines))}
+    checked = _closure(checked, bodies)
+    return {k for k in writers - checked
+            if annotations.get(k, set()) & _ON_SERVER and annotations[k] & _FROM_CLIENT}
+
+
 def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                 sanitizers: str = "", min_period: str = "",
                 server_file: Path | None = None, data_file: Path | None = None,
-                max_accesses: str = "") -> list[report.Finding]:
+                max_accesses: str = "", unguarded_file: Path | None = None) -> list[report.Finding]:
     cmd = [sys.executable, "-m", "xbsl", "--data-dir", str(data_dir), "--lang", "ru",
            "--select", ",".join(rules), "--format", "json", *paths]
     env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths))),
                               SANITIZERS_ENV: sanitizers,
                               SERVER_ENV: str(server_file or ""),
                               DATA_ENV: str(data_file or ""),
+                              UNGUARDED_ENV: str(unguarded_file or ""),
                               MIN_PERIOD_ENV: min_period,
                               MAX_ACCESSES_ENV: max_accesses})
     done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
@@ -153,9 +178,11 @@ def _check(args) -> int:
         server_file.write_text("\n".join(sorted(server_methods(args.paths))), encoding="utf-8")
         data_file = Path(tmp) / "data.txt"
         data_file.write_text("\n".join(sorted(data_methods(args.paths))), encoding="utf-8")
+        unguarded_file = Path(tmp) / "unguarded.txt"
+        unguarded_file.write_text("\n".join(sorted(unguarded_methods(args.paths))), encoding="utf-8")
         findings = _run_engine(args.paths, data_dir, rules, args.sanitizers or "",
                                args.min_period or "", server_file, data_file,
-                               args.max_accesses or "")
+                               args.max_accesses or "", unguarded_file)
     report.apply_exceptions(findings, root)
     if args.perimeter:
         report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))
@@ -199,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--data-dir", help="готовые данные о языке (xbsl-sonar data)")
     c.add_argument("--rules", help="правила через запятую; по умолчанию все")
     c.add_argument("--perimeter", help="перечень периметра для ПР-03: строки «путь: Ключ — причина»")
-    c.add_argument("--agreed", help="согласованные находки ПР-04, ПР-16 и ПР-17: "
+    c.add_argument("--agreed", help="согласованные находки ПР-02, ПР-04, ПР-16 и ПР-17: "
                                     "строки «путь: ПР-NN Ключ — причина»")
     c.add_argument("--sanitizers", help="функции очистки разметки для ПР-04 через запятую; "
                                         "по умолчанию «очистить»")

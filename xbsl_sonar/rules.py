@@ -310,6 +310,43 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-1073",
         effort_minutes=30,
     ),
+    "ПР-06": RuleText(
+        code="ПР-06",
+        name="Секрет строкой в коде",
+        description=(
+            "<p>Токен, пароль или ключ, записанный в коде строкой, уходит вместе с исходниками: "
+            "в репозиторий, в его копии и историю, в выгрузку проекта. Сменить его можно только "
+            "новой сборкой, а прочитать — любому, у кого есть код.</p>"
+            "<p><b>Находка:</b></p><ul>"
+            "<li>строковый литерал присваивается или передаётся именованным аргументом туда, "
+            "чьё имя говорит о секрете: <code>Токен</code>, <code>Пароль</code>, "
+            "<code>Секрет</code>, <code>КлючAPI</code>, <code>ПриватныйКлюч</code> и латиницей "
+            "<code>token</code>, <code>password</code>, <code>secret</code>, <code>apikey</code> "
+            "(в любом месте имени: <code>ТокенБота</code>, <code>ПарольОтправителя</code>), "
+            "или кладётся в соответствие под таким ключом-строкой "
+            "(<code>Вставить(\"password\", \"…\")</code>);</li>"
+            "<li>литерал, похожий на секрет сам по себе, где бы он ни стоял: токен "
+            "Telegram-бота (<code>цифры:35 знаков</code>), заголовок "
+            "<code>Bearer …</code> или <code>Basic …</code> с длинным значением;</li>"
+            "<li>в YAML — <code>ЗначениеПоУмолчанию</code> реквизита с таким именем "
+            "или типа <code>СекретПриложения</code>.</li>"
+            "</ul><p>Секретом считается значение не короче 8 знаков, без пробелов, кириллицы "
+            "и подстановок <code>%</code>: подписи, сообщения и шаблоны адресов "
+            "(<code>\"/bot%{Токен()}/…\"</code>) не находки.</p>"
+            "<p><b>Не находка:</b> литерал там, где имя не про секрет "
+            "(<code>Пользователь = \"AUTH_TOKEN\"</code>); имя поля протокола, а значение — "
+            "переменная (<code>Вставить(\"secret_token\", Токен)</code>); пустая строка "
+            "и короткие заглушки; значение из реквизита настроек или <code>СекретПриложения</code>.</p>"
+            "<p><b>Как исправить:</b> хранить секрет в реквизите типа <code>СекретПриложения</code> "
+            "или в настройках приложения и читать на сервере; секрет, уже попавший в репозиторий, "
+            "считать раскрытым и сменить.</p>"
+            "<p>CWE-798: Use of Hard-coded Credentials.</p>"
+        ),
+        type="VULNERABILITY",
+        severity="CRITICAL",
+        cwe="CWE-798",
+        effort_minutes=30,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -1349,5 +1386,96 @@ def admin_only_in_interface(source: SourceFile) -> Iterable[Diagnostic]:
                 f"с текущим пользователем — значение приходит из данных формы с клиента. "
                 f"Проверить в ПередЗаписью, что {'его' if len(fields) == 1 else 'их'} меняет "
                 f"администратор.",
+            ))
+    return out
+
+
+# ПР-06: секрет строкой. Имя говорит о секрете — переменная, свойство, именованный
+# аргумент, ключ соответствия; значение похоже на секрет — длинное, без пробелов,
+# кириллицы и подстановок. Токен бота и заголовок авторизации ловятся по самому литералу.
+_SECRET_NAME = re.compile(
+    r"токен|пароль|секрет|ключapi|ключапи|приватныйключ|закрытыйключ"
+    r"|token|passw|secret|apikey|api_key|privatekey|private_key", re.IGNORECASE)
+_SECRET_SHAPED = re.compile(
+    r"\d{8,10}:[A-Za-z0-9_-]{35}|(?:Bearer|Basic)\s+[A-Za-z0-9+/=._-]{16,}")
+_YAML_DEFAULT = re.compile(r"^(\s*)(?:-\s+)?(ЗначениеПоУмолчанию|DefaultValue):\s*(.*?)\s*$")
+_YAML_ITEM_KEY = re.compile(r"^(\s*)(?:-\s+)?(Имя|Name|Тип|Type):\s*(.*?)\s*$")
+_APP_SECRET = re.compile(r"СекретПриложения|ApplicationSecret")
+
+
+def _literal(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _secret_like(value: str) -> bool:
+    return (len(value) >= 8 and not re.search(r"[\sа-яА-ЯёЁ%]", value)
+            and not value.startswith("="))
+
+
+def _secret_in_yaml(source: SourceFile) -> list[Diagnostic]:
+    out: list[Diagnostic] = []
+    lines = source.text.splitlines()
+    for n, line in enumerate(lines):
+        m = _YAML_DEFAULT.match(line)
+        if not m or not _secret_like(_literal(m.group(3))):
+            continue
+        ind = len(m.group(1))
+        name, kind = "", ""
+        for k in range(n - 1, -1, -1):
+            if lines[k].strip() and _indent(lines[k]) < ind:
+                break
+            key = _YAML_ITEM_KEY.match(lines[k])
+            if key and len(key.group(1)) + (2 if lines[k].lstrip().startswith("-") else 0) == ind:
+                if key.group(2) in ("Имя", "Name"):
+                    name = key.group(3)
+                else:
+                    kind = key.group(3)
+        if _SECRET_NAME.search(name) or _APP_SECRET.search(kind):
+            out.append(Diagnostic(
+                source.rel, n + 1, ind + 1, "ПР-06", Severity.WARNING,
+                f"Секрет {name or kind}: значение по умолчанию задано строкой в описании элемента — "
+                f"оно уходит с исходниками. Задавать секрет в приложении, а не в YAML.",
+            ))
+    return out
+
+
+@rule("ПР-06", "Секрет строкой в коде", "S", severity=Severity.WARNING)
+def hardcoded_secret(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind == "yaml":
+        return _secret_in_yaml(source)
+    if source.kind != "xbsl":
+        return []
+    toks = code_tokens(source)
+    out: list[Diagnostic] = []
+    for i, t in enumerate(toks):
+        if t.kind != "STRING":
+            continue
+        value = _literal(t.value)
+        if _SECRET_SHAPED.search(value):
+            out.append(Diagnostic(
+                source.rel, t.line, t.col, "ПР-06", Severity.WARNING,
+                "Секрет в строке: литерал похож на токен или заголовок авторизации — "
+                "он уходит с исходниками. Хранить в СекретПриложения или в настройках.",
+            ))
+            continue
+        follows = toks[i + 1].value if i + 1 < len(toks) else ""
+        if not _secret_like(value) or follows in ("+", "."):
+            continue
+        prev = toks[i - 1] if i >= 1 else None
+        holder = None
+        if prev is not None and prev.kind == "OP" and prev.value == "=" and i >= 2 \
+                and toks[i - 2].kind == "IDENT":
+            holder = toks[i - 2].value
+        elif prev is not None and prev.kind == "OP" and prev.value == "," and i >= 2 \
+                and toks[i - 2].kind == "STRING" and i >= 3 and toks[i - 3].value == "(":
+            holder = _literal(toks[i - 2].value)
+        if holder and _SECRET_NAME.search(holder):
+            out.append(Diagnostic(
+                source.rel, t.line, t.col, "ПР-06", Severity.WARNING,
+                f"Секрет {holder}: значение задано строкой в коде — оно уходит с исходниками "
+                f"и меняется только сборкой. Хранить в СекретПриложения или в настройках "
+                f"и читать на сервере.",
             ))
     return out

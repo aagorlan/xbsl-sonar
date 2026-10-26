@@ -347,6 +347,41 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-798",
         effort_minutes=30,
     ),
+    "ПР-07": RuleText(
+        code="ПР-07",
+        name="Персональные данные мимо журнала доступа или в журнале событий",
+        description=(
+            "<p>Кто и когда видел чужие персональные данные, должно оставаться в журнале доступа; "
+            "сами данные и секреты не должны оседать там, где их читают для разбора ошибок, — "
+            "в журнале событий и в обращениях в поддержку.</p>"
+            "<p><b>Находка — чтение ПДн мимо журнала</b> (работает, когда проект задал перечень "
+            "сущностей ПДн <code>--pd-entities</code>; метод журнала — <code>--pd-journal</code>):</p><ul>"
+            "<li>метод <code>@НаСервере @ДоступноСКлиента</code> загружает запись или объект сущности "
+            "ПДн (<code>КлючЗаписи(…).ЗагрузитьЗапись()</code>, <code>Загрузить…()</code>) или выбирает "
+            "запросом поле ПДн, кроме измерений, — и ни он, ни вызываемые им не пишут журнал;</li>"
+            "<li>форма записи или объекта сущности ПДн, список над ней с полем кроме измерений — "
+            "и модуль формы журнал не зовёт.</li></ul>"
+            "<p><b>Находка — ПДн или секрет в журнале:</b> подстановка <code>%Имя</code>, "
+            "<code>%{…}</code> или сложение со значением, чьё имя говорит о ПДн (<code>Почта</code>, "
+            "<code>Email</code>, <code>Телефон</code>, <code>Фамилия</code>, <code>Отчество</code>, "
+            "<code>ФИО</code>, <code>Логин</code>, <code>Паспорт</code>, <code>Адрес</code> как имя "
+            "целиком) или о секрете (как в ПР-06), — в тексте <code>выбросить новый …(…)</code> "
+            "(не пойманное исключение платформа пишет в журнал событий) и в аргументах приёмников "
+            "обращений <code>--incident-sinks</code>.</p>"
+            "<p><b>Не находка:</b> сверка с текущим пользователем или проверка права до чтения "
+            "(своё читает сам человек); выборка только измерений и <code>КОЛИЧЕСТВО</code>; серверный "
+            "метод без доступа с клиента (рассылка, удаление); <code>Представление()</code> ссылки, "
+            "коды и тело ответа сервиса, литерал без подстановки.</p>"
+            "<p><b>Как исправить:</b> записать доступ в журнал при чтении чужих ПДн или сверить, "
+            "что читается своё; в сообщение ошибки писать ссылку или код записи, а не значение.</p>"
+            "<p>CWE-778: Insufficient Logging; CWE-532: Insertion of Sensitive Information into "
+            "Log File; CWE-223: Omission of Security-relevant Information. OWASP A09.</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MAJOR",
+        cwe="CWE-778",
+        effort_minutes=20,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -1479,3 +1514,233 @@ def hardcoded_secret(source: SourceFile) -> Iterable[Diagnostic]:
                 f"и читать на сервере.",
             ))
     return out
+
+
+# ПР-07: журналирование ПДн. Первая половина — чтение ПДн человеком мимо журнала доступа:
+# что считать ПДн и что журналом, знает только проект (`--pd-entities`, `--pd-journal`);
+# без перечня ПДн половина не работает. Вторая — ПДн или секрет в тексте исключения
+# (оно уходит в журнал событий) и в приёмниках обращений (`--incident-sinks`).
+# Сущности ПДн с их измерениями: `Сущность:Изм1|Изм2,…` — собирает `check` по YAML проекта.
+PD_ENTITIES_ENV = "XBSL_SONAR_PD_ENTITIES"
+# Методы журнала доступа (`Модуль.Метод` через запятую) — параметр `--pd-journal`.
+PD_JOURNAL_ENV = "XBSL_SONAR_PD_JOURNAL"
+# Методы, которые пишут журнал сами или через вызываемые, — файл, его собирает `check`.
+PD_JOURNALED_ENV = "XBSL_SONAR_PD_JOURNALED"
+# Приёмники обращений (`Модуль.Метод` через запятую) — параметр `--incident-sinks`.
+INCIDENT_SINKS_ENV = "XBSL_SONAR_INCIDENT_SINKS"
+
+_PD_NAME = re.compile(
+    r"почт|e_?mail|телефон|phone|фамили|отчеств|фио|логин|login|паспорт|passport",
+    re.IGNORECASE)
+_PD_EXACT = {"Адрес", "АдресПочты", "Address", "АдресЭлектроннойПочты"}
+_PD_SUBSTITUTION = re.compile(r"%\{([^}]*)\}|%([^\W\d]\w*)")
+_PD_IDENT = re.compile(r"[^\W\d]\w*")
+_PD_LOADS = re.compile(r"\.\s*(?:ЗагрузитьЗапись|ЗагрузитьОбъект|Загрузить|LoadRecord|LoadObject|Load)\s*\(")
+_PD_COUNT = re.compile(r"(?:КОЛИЧЕСТВО|COUNT)\s*\([^)]*\)", re.IGNORECASE)
+_JOURNALED_SET: dict[str, frozenset[str]] = {}
+
+
+def _pd_entities() -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for item in filter(None, os.environ.get(PD_ENTITIES_ENV, "").split(",")):
+        name, _, dims = item.partition(":")
+        out[name] = set(filter(None, dims.split("|")))
+    return out
+
+
+def _journaled() -> frozenset[str]:
+    path = os.environ.get(PD_JOURNALED_ENV, "")
+    if path not in _JOURNALED_SET:
+        try:
+            with open(path, encoding="utf-8") as f:
+                _JOURNALED_SET[path] = frozenset(filter(None, f.read().splitlines()))
+        except OSError:
+            _JOURNALED_SET[path] = frozenset()
+    journal = set(filter(None, os.environ.get(PD_JOURNAL_ENV, "").split(",")))
+    return _JOURNALED_SET[path] | journal
+
+
+def _pd_sensitive(expr: str) -> str | None:
+    """Имя ПДн или секрета в выражении подстановки; `Представление()` ссылки — не ПДн."""
+    if "Представление" in expr or "Presentation" in expr:
+        return None
+    for name in _PD_IDENT.findall(expr):
+        if name in _PD_EXACT or _PD_NAME.search(name) or _SECRET_NAME.search(name):
+            return name
+    return None
+
+
+def _query_reads(body: str, entities: dict[str, set[str]]) -> str | None:
+    """Сущность ПДн, поле которой (кроме измерений) запрос выводит в выборку."""
+    for m in re.finditer(r"(?:ИЗ|FROM)\s+(\w+)(?:\s+(?:КАК|AS)\s+(\w+))?", body):
+        entity = m.group(1)
+        if entity not in entities:
+            continue
+        start = max(body.rfind("ВЫБРАТЬ", 0, m.start()), body.rfind("SELECT", 0, m.start()))
+        if start < 0:
+            continue
+        selection = _PD_COUNT.sub("", body[start:m.start()])
+        aliases = {entity, m.group(2) or entity}
+        for alias, field in re.findall(r"(\w+)\.(\w+)", selection):
+            if alias in aliases and field not in entities[entity]:
+                return entity
+    return None
+
+
+def _calls_any(text: str, own: str, keys: frozenset[str]) -> bool:
+    return any(f"{q or own}.{name}" in keys for q, name in _TEXT_CALL.findall(text))
+
+
+def _pd_reads_xbsl(source: SourceFile, entities: dict[str, set[str]]) -> list[Diagnostic]:
+    own = source.path.name.split(".")[0]
+    identity = frozenset(filter(None, os.environ.get(IDENTITY_ENV, "").split(",")))
+    journaled = _journaled()
+    out: list[Diagnostic] = []
+    methods: list[tuple[str, int, set[str], list[str]]] = []
+    pending: set[str] = set()
+    for n, line in enumerate(source.text.splitlines(), 1):
+        m = _TEXT_METHOD.match(line)
+        if m:
+            methods.append((m.group(1), n, pending, []))
+            pending = set()
+        elif line.lstrip().startswith("@"):
+            pending |= set(re.findall(r"@(\w+)", line))
+        elif methods:
+            methods[-1][3].append(line)
+    for name, line, ann, lines in methods:
+        if not (ann & _SERVER and ann & _FROM_CLIENT):
+            continue
+        body = "\n".join(lines)
+        entity = None
+        for candidate in entities:
+            for stmt in re.split(r";|\n\s*\n", body):
+                if re.search(rf"(?<![\w.]){candidate}\s*\.", stmt) and _PD_LOADS.search(stmt):
+                    entity = candidate
+                    break
+            if entity:
+                break
+        entity = entity or _query_reads(body, entities)
+        if entity is None:
+            continue
+        if (_calls_any(body, own, journaled) or _calls_any(body, own, identity)
+                or re.search(r"(?<![\w])(?:ТекущийПользователь|CurrentUser|ПроверитьПраво|ЕстьПраво"
+                             r"|CheckRight|HasRight)\b", body)):
+            continue
+        out.append(Diagnostic(
+            source.rel, line, 1, "ПР-07", Severity.WARNING,
+            f"Метод '{name}' доступен с клиента и читает персональные данные ({entity}) "
+            f"без записи в журнал доступа и без сверки с текущим пользователем: чужие ПДн "
+            f"уйдут человеку незаметно. Записать доступ в журнал или сверить, что читается своё.",
+        ))
+    return out
+
+
+_PD_YAML_FORM = re.compile(r"^\s*(?:-\s+)?(?:Тип|Type):\s*(?:ФормаЗаписи|ФормаОбъекта|RecordForm|ObjectForm)"
+                        r"<\s*(\w+)\s*\.", re.MULTILINE)
+_PD_YAML_TABLE = re.compile(r"^\s*(?:-\s+)?(?:Таблица|Table):\s*(\w+)\s*$", re.MULTILINE)
+_PD_YAML_FIELD = re.compile(r"^\s*(?:-\s+)?(?:Выражение|Expression):\s*(\S+)\s*$", re.MULTILINE)
+
+
+def _pd_reads_yaml(source: SourceFile, entities: dict[str, set[str]]) -> list[Diagnostic]:
+    text = source.text
+    found: tuple[str, int] | None = None
+    for m in _PD_YAML_FORM.finditer(text):
+        if m.group(1) in entities:
+            found = (m.group(1), text.count("\n", 0, m.start()) + 1)
+            break
+    if found is None:
+        for m in _PD_YAML_TABLE.finditer(text):
+            entity = m.group(1)
+            if entity not in entities:
+                continue
+            fields = [f.group(1).split(".")[0] for f in _PD_YAML_FIELD.finditer(text, m.end())]
+            if any(f not in entities[entity] for f in fields):
+                found = (entity, text.count("\n", 0, m.start()) + 1)
+                break
+    if found is None:
+        return []
+    pair = _read_pair(source.path, ".xbsl") or ""
+    if _calls_any(pair, source.path.name.split(".")[0], _journaled()):
+        return []
+    return [Diagnostic(
+        source.rel, found[1], 1, "ПР-07", Severity.WARNING,
+        f"Форма показывает персональные данные ({found[0]}) без записи в журнал доступа: "
+        f"модуль формы журнал не зовёт. Записать доступ при чтении (ПослеЧтения) "
+        f"или не выводить поля ПДн.",
+    )]
+
+
+def _sink_args(toks: list) -> list[tuple[int, int, str]]:
+    """Аргументы исключений и приёмников обращений: (начало, конец, что) — индексы токенов."""
+    sinks = set(filter(None, os.environ.get(INCIDENT_SINKS_ENV, "").split(",")))
+    sink_names = {s.split(".")[-1]: s for s in sinks}
+    out = []
+    for i, t in enumerate(toks):
+        start = None
+        what = ""
+        if t.kind == "KEYWORD" and t.canonical == "THROW":
+            k = i + 1
+            while k < len(toks) and toks[k].value != "(" and toks[k].line - t.line < 3:
+                k += 1
+            if k < len(toks) and toks[k].value == "(":
+                start, what = k, "текст исключения"
+        elif (t.kind == "IDENT" and t.value in sink_names and i + 1 < len(toks)
+              and toks[i + 1].value == "("):
+            module = sink_names[t.value].rsplit(".", 1)[0] if "." in sink_names[t.value] else ""
+            if not module or (i >= 2 and toks[i - 1].value == "." and toks[i - 2].value == module):
+                start, what = i + 1, f"обращение ({t.value})"
+        if start is None:
+            continue
+        depth, k = 0, start
+        while k < len(toks):
+            if toks[k].value == "(":
+                depth += 1
+            elif toks[k].value == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        out.append((start, k, what))
+    return out
+
+
+def _pd_in_log(source: SourceFile) -> list[Diagnostic]:
+    toks = code_tokens(source)
+    out: list[Diagnostic] = []
+    for start, end, what in _sink_args(toks):
+        for k in range(start + 1, end):
+            t = toks[k]
+            name = None
+            if t.kind == "STRING":
+                for braced, bare in _PD_SUBSTITUTION.findall(t.value):
+                    name = _pd_sensitive(braced or bare)
+                    if name:
+                        break
+            elif t.kind == "IDENT" and toks[k - 1].value == "+":
+                chain = [t.value]
+                j = k + 1
+                while j + 1 < end and toks[j].value == "." and toks[j + 1].kind == "IDENT":
+                    chain.append(toks[j + 1].value)
+                    j += 2
+                name = _pd_sensitive(".".join(chain))
+            if name:
+                out.append(Diagnostic(
+                    source.rel, t.line, t.col, "ПР-07", Severity.WARNING,
+                    f"{name}: персональные данные или секрет попадают в {what} — оттуда "
+                    f"в журнал событий и обращения в поддержку, которые читают администраторы. "
+                    f"Писать в сообщение ссылку или код, а не само значение.",
+                ))
+                break
+    return out
+
+
+@rule("ПР-07", "Персональные данные мимо журнала доступа или в журнале событий", "S",
+      severity=Severity.WARNING)
+def pd_logging(source: SourceFile) -> Iterable[Diagnostic]:
+    entities = _pd_entities()
+    if source.kind == "yaml":
+        return _pd_reads_yaml(source, entities) if entities else []
+    if source.kind != "xbsl":
+        return []
+    out = _pd_reads_xbsl(source, entities) if entities else []
+    return out + _pd_in_log(source)

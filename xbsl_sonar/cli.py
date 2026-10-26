@@ -24,7 +24,7 @@ import tempfile
 from pathlib import Path
 
 from xbsl_sonar import __version__, data, report
-from xbsl_sonar.rules import (DATA_ENV, IDENTITY_ENV, INCIDENT_SINKS_ENV, MAX_ACCESSES_ENV,
+from xbsl_sonar.rules import (ADMIN_ENV, DATA_ENV, IDENTITY_ENV, UPLOAD_ENV, INCIDENT_SINKS_ENV, MAX_ACCESSES_ENV,
                                MIN_PERIOD_ENV, PD_ENTITIES_ENV, PD_JOURNAL_ENV, PD_JOURNALED_ENV,
                                RULE_IDS, SANITIZERS_ENV, SERVER_ENV, UNGUARDED_ENV)
 
@@ -141,6 +141,61 @@ def unguarded_methods(paths: list[str]) -> set[str]:
             if annotations.get(k, set()) & _ON_SERVER and annotations[k] & _FROM_CLIENT}
 
 
+_ADMIN = re.compile(r"\b(?:Администратор|Administrator)\b")
+
+
+def admin_methods(paths: list[str]) -> set[str]:
+    """Методы, которые сверяют администратора (для ПР-08), — `Модуль.Метод`.
+
+    Такой метод читает признак `Администратор` вместе с `ТекущийПользователь` или вызывает
+    другой такой метод — набор замыкается по вызовам: `ПроверитьПрава()`, зовущий
+    `ЭтоАдминистратор()`, тоже сверка.
+    """
+    bodies, _ = _bodies(paths)
+    found = {key for key, lines in bodies.items()
+             if _ADMIN.search(text := "\n".join(lines)) and _CURRENT_USER.search(text)}
+    return _closure(found, bodies)
+
+
+_UPLOAD = re.compile(r"(?:ЗагрузкаФайлов|FilesUpload)\s*\.\s*(?:НачатьЗагрузку|StartUpload)\s*\("
+                     r"|(?:СобытиеСДанными|EventWithData)\s*<\s*(?:ДвоичныйОбъект|BinaryObject)")
+
+
+def upload_methods(paths: list[str]) -> set[str]:
+    """Методы, до которых доходит загруженный файл (для ПР-08), — `Модуль.Метод`.
+
+    Загрузка — `ЗагрузкаФайлов.НачатьЗагрузку(…)` в теле или обработчик `ПриЗагрузкеФайла`
+    (параметр `СобытиеСДанными<ДвоичныйОбъект.Ссылка>`). Набор — методы, которые такой метод
+    вызывает, и дальше по вызовам: так файл из обработчика доходит до серверного метода,
+    а метод, который получает ссылку на уже сохранённый файл (версия, вложение), в набор
+    не попадает.
+    """
+    bodies, _ = _bodies(paths)
+    headers: dict[str, str] = {}
+    files: list[Path] = []
+    for p in map(Path, paths):
+        files.extend(sorted(p.rglob("*.xbsl")) if p.is_dir() else [p])
+    for file in files:
+        module = file.name.split(".")[0]
+        for line in file.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = _METHOD.match(line)
+            if m:
+                headers[f"{module}.{m.group(1)}"] = line
+    calls: dict[str, set[str]] = {}
+    for key, lines in bodies.items():
+        own = key.split(".")[0]
+        calls[key] = {f"{q or own}.{name}" for q, name in _CALL.findall("\n".join(lines))}
+    uploaders = {key for key, lines in bodies.items()
+                 if _UPLOAD.search(headers.get(key, "") + "\n" + "\n".join(lines))}
+    fed: set[str] = set()
+    frontier = set().union(*(calls.get(k, set()) for k in uploaders)) if uploaders else set()
+    while frontier - fed:
+        new = frontier - fed
+        fed |= new
+        frontier = set().union(*(calls.get(k, set()) for k in new))
+    return fed
+
+
 def journaled_methods(paths: list[str], journal: list[str]) -> set[str]:
     """Методы, которые пишут журнал доступа ПДн (для ПР-07): сами зовут метод журнала
     или зовут такой метод — набор замыкается по вызовам, как у `identity_methods`."""
@@ -183,7 +238,9 @@ def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                 sanitizers: str = "", min_period: str = "",
                 server_file: Path | None = None, data_file: Path | None = None,
                 max_accesses: str = "", unguarded_file: Path | None = None,
-                pd: dict[str, str] | None = None) -> list[report.Finding]:
+                pd: dict[str, str] | None = None,
+                admin_file: Path | None = None,
+                upload_file: Path | None = None) -> list[report.Finding]:
     cmd = [sys.executable, "-m", "xbsl", "--data-dir", str(data_dir), "--lang", "ru",
            "--select", ",".join(rules), "--format", "json", *paths]
     env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths))),
@@ -191,6 +248,8 @@ def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                               SERVER_ENV: str(server_file or ""),
                               DATA_ENV: str(data_file or ""),
                               UNGUARDED_ENV: str(unguarded_file or ""),
+                              ADMIN_ENV: str(admin_file or ""),
+                              UPLOAD_ENV: str(upload_file or ""),
                               MIN_PERIOD_ENV: min_period,
                               MAX_ACCESSES_ENV: max_accesses, **(pd or {})})
     done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
@@ -222,6 +281,10 @@ def _check(args) -> int:
         data_file.write_text("\n".join(sorted(data_methods(args.paths))), encoding="utf-8")
         unguarded_file = Path(tmp) / "unguarded.txt"
         unguarded_file.write_text("\n".join(sorted(unguarded_methods(args.paths))), encoding="utf-8")
+        admin_file = Path(tmp) / "admin.txt"
+        admin_file.write_text("\n".join(sorted(admin_methods(args.paths))), encoding="utf-8")
+        upload_file = Path(tmp) / "upload.txt"
+        upload_file.write_text("\n".join(sorted(upload_methods(args.paths))), encoding="utf-8")
         pd_names = list(filter(None, (args.pd_entities or "").split(",")))
         journal = list(filter(None, (args.pd_journal or "").split(",")))
         journaled_file = Path(tmp) / "journaled.txt"
@@ -232,7 +295,8 @@ def _check(args) -> int:
               INCIDENT_SINKS_ENV: args.incident_sinks or ""}
         findings = _run_engine(args.paths, data_dir, rules, args.sanitizers or "",
                                args.min_period or "", server_file, data_file,
-                               args.max_accesses or "", unguarded_file, pd)
+                               args.max_accesses or "", unguarded_file, pd, admin_file,
+                               upload_file)
     report.apply_exceptions(findings, root)
     if args.perimeter:
         report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))

@@ -2,11 +2,12 @@
 #
 #   jobs:
 #     analysis:
-#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.8.0
+#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.10.0
 #       with:
-#         version: v0.8.0
+#         version: v0.10.0
 #         perimeter: docs/периметр.txt   # для ПР-03, можно не задавать
-#         agreed: docs/согласовано.txt   # для ПР-04 и ПР-16, можно не задавать
+#         agreed: docs/согласовано.txt   # согласованные находки, можно не задавать
+#         pd-entities: УчастникиПерсДанные  # для ПР-07, можно не задавать
 #         sonar-url: ${{ vars.SONAR_URL }}
 #       secrets:
 #         sonar-token: ${{ secrets.SONAR_TOKEN }}
@@ -36,7 +37,19 @@ on:
         type: string
         default: ''
       agreed:
-        description: 'Согласованные находки ПР-02, ПР-04, ПР-05, ПР-16 и ПР-17 (строки «путь: ПР-NN Ключ — причина»); пусто — без перечня'
+        description: 'Согласованные находки ПР-02, ПР-04, ПР-05, ПР-07, ПР-16 и ПР-17 (строки «путь: ПР-NN Ключ — причина»); пусто — без перечня'
+        type: string
+        default: ''
+      pd-entities:
+        description: 'Сущности персональных данных для ПР-07 через запятую; пусто — чтение ПДн не проверяется'
+        type: string
+        default: ''
+      pd-journal:
+        description: 'Методы журнала доступа ПДн для ПР-07 (Модуль.Метод) через запятую'
+        type: string
+        default: ''
+      incident-sinks:
+        description: 'Методы, которые пишут обращения в поддержку, для ПР-07 (Модуль.Метод) через запятую'
         type: string
         default: ''
       sonar-url:
@@ -86,8 +99,12 @@ jobs:
           [ -z "${{ inputs.perimeter }}" ] || perimeter=(--perimeter "${{ inputs.perimeter }}")
           agreed=()
           [ -z "${{ inputs.agreed }}" ] || agreed=(--agreed "${{ inputs.agreed }}")
+          pd=()
+          [ -z "${{ inputs.pd-entities }}" ] || pd+=(--pd-entities "${{ inputs.pd-entities }}")
+          [ -z "${{ inputs.pd-journal }}" ] || pd+=(--pd-journal "${{ inputs.pd-journal }}")
+          [ -z "${{ inputs.incident-sinks }}" ] || pd+=(--incident-sinks "${{ inputs.incident-sinks }}")
           "$RUNNER_TEMP/xbsl-sonar/bin/xbsl-sonar" check ${{ inputs.paths }} \
-            --help-dir "${{ inputs.help-dir }}" "${perimeter[@]}" "${agreed[@]}" \
+            --help-dir "${{ inputs.help-dir }}" "${perimeter[@]}" "${agreed[@]}" "${pd[@]}" \
             --json .xbsl-sonar/findings.json \
             --bsl-report .xbsl-sonar/bsl-report.json || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"

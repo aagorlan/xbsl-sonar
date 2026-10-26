@@ -2,9 +2,9 @@
 #
 #   jobs:
 #     analysis:
-#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.10.0
+#       uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.11.0
 #       with:
-#         version: v0.10.0
+#         version: v0.11.0
 #         perimeter: docs/периметр.txt   # для ПР-03, можно не задавать
 #         agreed: docs/согласовано.txt   # согласованные находки, можно не задавать
 #         pd-entities: УчастникиПерсДанные  # для ПР-07, можно не задавать

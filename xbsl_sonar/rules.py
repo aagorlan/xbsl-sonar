@@ -382,6 +382,51 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-778",
         effort_minutes=20,
     ),
+    "ПР-08": RuleText(
+        code="ПР-08",
+        name="Загрузка файла без проверки размера и типа",
+        description=(
+            "<p>Файл, который пользователь передаёт приложению, попадает на сервер, и сервер "
+            "сохраняет или разбирает его, не проверив ни размер, ни тип. Ограничения интерфейса — "
+            "фильтр диалога выбора, предел размера списка файлов — работают только на клиенте: "
+            "прямой вызов метода или HTTP-запрос их обходят. Без предела сервер можно забить "
+            "гигабайтами, а под видом картинки положить файл, который приложение потом покажет "
+            "другим.</p>"
+            "<p><b>Находка</b> — файл из одного из источников, а на сервере нет проверки размера, "
+            "типа или обеих:</p><ul>"
+            "<li>параметр типа <code>ДвоичныйОбъект.Ссылка</code>, <code>ДвоичныйОбъект</code>, "
+            "<code>Байты</code> или <code>ПотокЧтения</code> метода <code>@НаСервере "
+            "@ДоступноСКлиента</code>, который этот параметр использует, — если файл до него "
+            "доходит из загрузки: метод вызван из метода с <code>ЗагрузкаФайлов.НачатьЗагрузку(…)</code> "
+            "или из обработчика <code>ПриЗагрузкеФайла</code> (сам или дальше по вызовам);</li>"
+            "<li>тело запроса в обработчике HTTP-сервиса — <code>Запрос.Тело.ПрочитатьКакБайты()</code>;</li>"
+            "<li>в модуле формы — <code>Объект.Реквизит = ЗагрузкаФайлов.НачатьЗагрузку(…)</code>: "
+            "реквизит уходит в базу записью формы, если <code>ПередЗаписью</code> модуля объекта "
+            "его не проверяет.</li></ul>"
+            "<p><b>Проверка размера</b> — сравнение <code>.Размер</code> (<code>РазмерБайтов</code>) "
+            "или <code>Байты.Размер()</code> с пределом. <b>Проверка типа</b> — условие "
+            "по <code>.РасширениеФайла</code> или <code>.ТипСодержимого</code>, за которым следует "
+            "отказ (<code>выбросить</code>, <code>возврат</code>), либо разбор, который сам "
+            "отвергает чужое, на уровне тела метода: <code>новый ОбрабатываемоеИзображение(…)</code>, "
+            "<code>СериализацияJson.Прочитать…</code>. Условие по типу без отказа (выбор превью) "
+            "проверкой не считается.</p>"
+            "<p><b>Не находка:</b> метод, который сверяет администратора, сам или в вызываемых "
+            "(<code>ЭтоАдминистратор()</code>, <code>ПроверитьПрава()</code>): загружает доверенный; "
+            "метод без доступа с клиента — его видимость задаёт вызывающий; ссылка на уже "
+            "сохранённый файл (версия, вложение), которая до метода доходит не из загрузки; выгрузка файла, "
+            "<code>Ресурс{…}</code>, файл, собранный на сервере; тело HTTP-запроса, прочитанное "
+            "строкой (JSON).</p>"
+            "<p><b>Как исправить:</b> до сохранения или разбора сравнить <code>Файл.Загрузить().Размер</code> "
+            "с пределом (<code>5мб</code>) и проверить расширение или тип по перечню допустимых — "
+            "и отказать; для картинок — перекодировать их на сервере.</p>"
+            "<p>CWE-434: Unrestricted Upload of File with Dangerous Type; CWE-400: Uncontrolled "
+            "Resource Consumption. OWASP A04.</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MAJOR",
+        cwe="CWE-434",
+        effort_minutes=20,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -418,6 +463,14 @@ DATA_ENV = "XBSL_SONAR_DATA"
 # (для ПР-02), — `Модуль.Метод` по строке; набор собирает `check` (`unguarded_methods`)
 # и кладёт файлом. Здесь — путь к этому файлу.
 UNGUARDED_ENV = "XBSL_SONAR_UNGUARDED"
+# Методы, которые сверяют администратора (для ПР-08), — `Модуль.Метод` по строке: читают
+# признак администратора текущего пользователя или зовут такой метод; набор собирает `check`
+# (`admin_methods`) и кладёт файлом. Здесь — путь к этому файлу.
+ADMIN_ENV = "XBSL_SONAR_ADMIN"
+# Методы, до которых доходит загруженный файл (для ПР-08): вызванные из метода с загрузкой
+# (`ЗагрузкаФайлов.НачатьЗагрузку`, `ПриЗагрузкеФайла`) и дальше по вызовам; набор собирает
+# `check` (`upload_methods`) и кладёт файлом. Здесь — путь к этому файлу.
+UPLOAD_ENV = "XBSL_SONAR_UPLOAD"
 # Порог обращений к серверу и базе в обработчике формы для ПР-17 — параметр `--max-accesses`.
 MAX_ACCESSES_ENV = "XBSL_SONAR_MAX_ACCESSES"
 DEFAULT_MAX_ACCESSES = 3
@@ -1744,3 +1797,165 @@ def pd_logging(source: SourceFile) -> Iterable[Diagnostic]:
         return []
     out = _pd_reads_xbsl(source, entities) if entities else []
     return out + _pd_in_log(source)
+
+
+# ПР-08: загрузка файла без проверки размера и типа.
+_FILE_PARAM = re.compile(r"(\w+)\s*:\s*(?:ДвоичныйОбъект(?:\.Ссылка)?|Байты|ПотокЧтения|BinaryObject"
+                         r"(?:\.Ref)?|Bytes|ReadableStream)\??\s*[,)]")
+_HTTP_PARAM = re.compile(r"(\w+)\s*:\s*(?:HttpСервисЗапрос|HttpServiceRequest)\s*[,)]")
+_BODY_BYTES = re.compile(r"\.\s*(?:Тело|Body)\s*\.\s*(?:ПрочитатьКакБайты|ReadAsBytes)\s*\(")
+_FORM_UPLOAD = re.compile(r"^\s*(?:Объект|Object)\.(\w+)\s*=\s*(?:ЗагрузкаФайлов|FilesUpload)\s*\."
+                          r"\s*(?:НачатьЗагрузку|StartUpload)\s*\(", re.MULTILINE)
+_SIZE_CHECK = re.compile(r"\.\s*(?:Размер|Size)\b(?:\s*\(\s*\))?\s*(?:<=?|>=?)(?!-)"
+                         r"|(?<!-)(?:<=?|>=?)\s*[\w.!?]*\.\s*(?:Размер|Size)\b")
+_TYPE_FIELD = re.compile(r"\b(?:ТипСодержимого|РасширениеФайла|ContentType|FileExtension)\b")
+_CONDITION = re.compile(r"^\s*(?:если|иначе\s+если|когда|выбор|if|else\s+if|case|when)\b", re.IGNORECASE)
+_REFUSAL = re.compile(r"^\s*(?:выбросить|возврат|throw|return)\b", re.IGNORECASE)
+# Разбор, который сам отвергает чужое: картинка — только на уровне тела метода (в ветке
+# условия она лишь строит превью), структура — где угодно
+_DECODE_IMAGE = re.compile(r"(?:новый|new)\s+(?:ОбрабатываемоеИзображение|ProcessingImage)\s*\(")
+_DECODE_DATA = re.compile(r"(?:СериализацияJson|JsonSerialization)\s*\.\s*(?:Прочитать|Read)\w*\s*\("
+                          r"|\.\s*(?:Десериализовать|Deserialize)\w*\s*\(")
+_ELSE = re.compile(r"^\s*(?:иначе|else)\s*$", re.IGNORECASE)
+
+# Файл сохраняется или разбирается: без этого метод только читает свойства уже сохранённого
+_STORE_OR_PARSE = re.compile(r"(?:ОбъектноеХранилище|ObjectStorage)\s*\.\s*(?:Загрузить|Upload)\w*\s*\("
+                             r"|\.\s*(?:Записать|Write)\s*\("
+                             r"|\.\s*(?:ОткрытьПотокЧтения|OpenReadStream|ПрочитатьКак\w+|ReadAs\w+)\s*\("
+                             r"|(?:новый|new)\s+(?:ОбрабатываемоеИзображение|ProcessingImage|Чтение\w+|\w+Reader)\s*\("
+                             r"|(?:СериализацияJson|JsonSerialization)\s*\.")
+
+_KEY_SETS: dict[str, frozenset[str]] = {}
+
+
+def _key_set(env: str) -> frozenset[str]:
+    """Набор `Модуль.Метод` из файла, путь к которому — в переменной окружения env."""
+    path = os.environ.get(env, "")
+    if path not in _KEY_SETS:
+        try:
+            with open(path, encoding="utf-8") as f:
+                _KEY_SETS[path] = frozenset(filter(None, f.read().splitlines()))
+        except OSError:
+            _KEY_SETS[path] = frozenset()
+    return _KEY_SETS[path]
+
+
+def _upload_checks(lines: list[str]) -> tuple[bool, bool]:
+    """(размер проверен, тип проверен) по строкам тела метода."""
+    sized = any(_SIZE_CHECK.search(line) for line in lines)
+    typed = False
+    body = [line for line in lines
+            if line.strip() not in ("", ";") and not line.lstrip().startswith("//")]
+    base = min((_indent(line) for line in body), default=0)
+    for k, line in enumerate(body):
+        if _CONDITION.match(line) and _TYPE_FIELD.search(line):
+            nxt = body[k + 1] if k + 1 < len(body) else ""
+            if _indent(nxt) > _indent(line) and _REFUSAL.match(nxt):
+                typed = True
+            # `выбор Файл.РасширениеФайла … иначе выбросить` — перечень допустимых с отказом
+            for j in range(k + 1, len(body) - 1):
+                if _indent(body[j]) < _indent(line):
+                    break
+                if (_indent(body[j]) == _indent(line) and _ELSE.match(body[j])
+                        and _REFUSAL.match(body[j + 1])):
+                    typed = True
+                    break
+        elif (_DECODE_IMAGE.search(line) and _indent(line) == base) or _DECODE_DATA.search(line):
+            typed = True
+    return sized, typed
+
+
+def _missing(sized: bool, typed: bool) -> str:
+    return " и ".join(w for w, ok in (("размера", sized), ("типа", typed)) if not ok)
+
+
+def _methods_with_headers(text: str) -> list[tuple[str, int, set[str], str, list[str]]]:
+    """Методы модуля: (имя, строка, аннотации, заголовок до закрывающей скобки, строки тела)."""
+    out: list[tuple[str, int, set[str], str, list[str]]] = []
+    pending: set[str] = set()
+    header: list[str] | None = None
+    for n, line in enumerate(text.splitlines(), 1):
+        m = _TEXT_METHOD.match(line)
+        if m:
+            out.append((m.group(1), n, pending, "", []))
+            pending = set()
+            header = [line]
+            if ")" in line:
+                out[-1] = out[-1][:3] + (line, [])
+                header = None
+        elif header is not None:
+            header.append(line)
+            if ")" in line:
+                out[-1] = out[-1][:3] + ("\n".join(header), [])
+                header = None
+        elif line.lstrip().startswith("@"):
+            pending |= set(re.findall(r"@(\w+)", line))
+        elif out:
+            out[-1][4].append(line)
+    return out
+
+
+def _guarded_by_admin(lines: list[str], own: str, admins: frozenset[str]) -> bool:
+    return any(f"{q or own}.{name}" in admins for q, name in _TEXT_CALL.findall("\n".join(lines)))
+
+
+def _form_uploads(source: SourceFile) -> list[Diagnostic]:
+    found = list(_FORM_UPLOAD.finditer(source.text))
+    if not found:
+        return []
+    described = _read_pair(source.path, ".yaml") or ""
+    form = _FORM_OF.search(described)
+    module = ""
+    if form:
+        for folder in (source.path.parent, source.path.parent.parent):
+            try:
+                module = (folder / (form.group(1) + ".Объект.xbsl")).read_text(encoding="utf-8-sig")
+                break
+            except OSError:
+                continue
+    before = next((b for name, b in _text_bodies(module).items() if name in _BEFORE_WRITE), "")
+    out = []
+    for m in found:
+        field = m.group(1)
+        if re.search(rf"(?<![\w]){re.escape(field)}(?![\w])", before):
+            continue
+        out.append(Diagnostic(
+            source.rel, source.text.count("\n", 0, m.start()) + 1, 1, "ПР-08", Severity.WARNING,
+            f"Загруженный файл уходит в реквизит '{field}' записью формы без проверки размера "
+            f"и типа на сервере: фильтр диалога выбора обходится. Проверить файл в ПередЗаписью "
+            f"модуля объекта или принимать его серверным методом с проверкой.",
+        ))
+    return out
+
+
+@rule("ПР-08", "Загрузка файла без проверки размера и типа", "S", severity=Severity.WARNING)
+def file_upload(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    own = source.path.name.split(".")[0]
+    admins = _key_set(ADMIN_ENV)
+    uploads = _key_set(UPLOAD_ENV)
+    out: list[Diagnostic] = []
+    for name, line, ann, header, lines in _methods_with_headers(source.text):
+        body = "\n".join(lines)
+        source_kind = None
+        if ann & _SERVER and ann & _FROM_CLIENT and f"{own}.{name}" in uploads:
+            used = [p for p in _FILE_PARAM.findall(header)
+                    if re.search(rf"(?<![\w.]){re.escape(p)}(?![\w])", body)]
+            if used:
+                source_kind = f"параметр {', '.join(used)} приходит с клиента"
+        if source_kind is None and _HTTP_PARAM.search(header) and _BODY_BYTES.search(body):
+            source_kind = "тело HTTP-запроса читается целиком"
+        if (source_kind is None or not _STORE_OR_PARSE.search(body)
+                or _guarded_by_admin(lines, own, admins)):
+            continue
+        sized, typed = _upload_checks(lines)
+        if sized and typed:
+            continue
+        out.append(Diagnostic(
+            source.rel, line, 1, "ПР-08", Severity.WARNING,
+            f"Метод '{name}' принимает файл ({source_kind}) без проверки {_missing(sized, typed)} "
+            f"на сервере: ограничения диалога выбора файла обходятся прямым вызовом. Сравнить "
+            f"размер с пределом и проверить тип до сохранения или разбора.",
+        ))
+    return out + _form_uploads(source)

@@ -25,6 +25,7 @@ from pathlib import Path
 
 from xbsl_sonar import __version__, data, report
 from xbsl_sonar.rules import (ADMIN_ENV, DATA_ENV, IDENTITY_ENV, UPLOAD_ENV, INCIDENT_SINKS_ENV, MAX_ACCESSES_ENV,
+                               UNBOUNDED_ENV,
                                MIN_PERIOD_ENV, PD_ENTITIES_ENV, PD_JOURNAL_ENV, PD_JOURNALED_ENV,
                                RULE_IDS, SANITIZERS_ENV, SERVER_ENV, UNGUARDED_ENV)
 
@@ -196,6 +197,234 @@ def upload_methods(paths: list[str]) -> set[str]:
     return fed
 
 
+# ПР-09: граница работы из значения извне без предела.
+_LOOP_OVER = re.compile(r"^\s*(?:для|for)\s+\w+\s+(?:из|in)\s+(\w+)((?:\s*[!?]?\.\s*\w+)*)\s*$", re.IGNORECASE)
+_LOOP_TO = re.compile(r"^\s*(?:для|for)\s+\w+\s*=.*?\s(?:по|to)\s+(\w+)((?:\s*[!?]?\.\s*\w+)*)\s*$", re.IGNORECASE)
+_FOR_EACH = re.compile(r"(?<![\w.])(\w+)((?:\s*[!?]?\.\s*\w+)*)\s*[!?]?\.\s*(?:ДляКаждого|ForEach)\s*\(")
+_TOP_N = re.compile(r"(?:ПЕРВЫЕ|TOP)\s+%\{?\s*(\w+)", re.IGNORECASE)
+# Обращение к данным или наружу в одном витке
+_STEP_ACCESS = re.compile(r"(?<![\w.])(?:Запрос|Query)\s*\{"
+                          r"|\.\s*(?:ЗагрузитьОбъект|ЗагрузитьЗапись|LoadObject|LoadRecord|Записать|Write)\s*\("
+                          r"|(?<![\w.])[А-ЯЁA-Z]\w*\s*\.\s*(?:Удалить|Delete)\s*\((?!\s*\d)"
+                          r"|(?:КлиентHttp|HttpClient|ЭлектроннаяПочта|Email)\s*\.\s*\w*(?:Отправить|Send)\w*\s*\(")
+_REQUEST_DATA = re.compile(r"\.\s*(?:Тело|Параметры|Заголовки|Body|Parameters|Headers)\b")
+_HTTP_REQUEST = re.compile(r"(\w+)\s*:\s*(?:HttpСервисЗапрос|HttpServiceRequest)\s*[,)]")
+_LOCAL = re.compile(r"^\s*(?:знч|пер|val|var)\s+(\w+)(?:\s*:[^=]*)?\s*=\s*(.+)$")
+_CONDITION_LINE = re.compile(r"^\s*(?:если|иначе\s+если|пока|if|else\s+if|while)\b|\?", re.IGNORECASE)
+
+
+def _methods(paths: list[str]) -> list[tuple[str, int, list[str], set[str], str, list[str]]]:
+    """Методы по отдельности, перегрузки тоже: (`Модуль.Метод`, строка заголовка, имена
+    параметров по порядку, аннотации, заголовок, строки тела до следующего заголовка)."""
+    out: list[tuple[str, int, list[str], set[str], str, list[str]]] = []
+    files: list[Path] = []
+    for p in map(Path, paths):
+        files.extend(sorted(p.rglob("*.xbsl")) if p.is_dir() else [p])
+    for file in files:
+        module = file.name.split(".")[0]
+        lines = file.read_text(encoding="utf-8", errors="replace").splitlines()
+        pending: set[str] = set()
+        skip = -1
+        for n, line in enumerate(lines):
+            if n <= skip:
+                continue
+            m = _METHOD.match(line)
+            if m:
+                header, k = line, n
+                while header.count("(") > header.count(")") and k + 1 < len(lines):
+                    k += 1
+                    header += " " + lines[k].strip()
+                skip = k
+                inner = header[header.find("(") + 1:]
+                params, depth, cur = [], 0, ""
+                for ch in inner:
+                    if ch in "(<[":
+                        depth += 1
+                    elif ch in ")>]":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif ch == "," and depth == 0:
+                        params.append(cur)
+                        cur = ""
+                        continue
+                    cur += ch
+                params.append(cur)
+                names = [x.split(":")[0].strip() for x in params if ":" in x]
+                out.append((f"{module}.{m.group(1)}", n + 1, names, pending, header, []))
+                pending = set()
+            elif line.lstrip().startswith("@"):
+                pending |= set(_ANNOTATION.findall(line))
+            elif out and out[-1][0].split(".")[0] == module:
+                out[-1][5].append(line)
+    return out
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _loop_body(lines: list[str], n: int) -> list[str]:
+    """Строки тела цикла, открытого строкой n: глубже её отступа до закрывающей `;`."""
+    base, body = _indent_of(lines[n]), []
+    for line in lines[n + 1:]:
+        if line.strip() and _indent_of(line) <= base:
+            break
+        body.append(line)
+    return body
+
+
+def _arguments(text: str) -> list[tuple[str, str, list[str]]]:
+    """Вызовы в тексте: (модуль или "", метод, аргументы строками на верхнем уровне скобок)."""
+    out = []
+    for m in _CALL.finditer(text):
+        depth, cur, args, k = 0, "", [], m.end()
+        while k < len(text):
+            ch = text[k]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    args.append(cur)
+                    break
+                depth -= 1
+            elif ch == "," and depth == 0:
+                args.append(cur)
+                cur = ""
+                k += 1
+                continue
+            cur += ch
+            k += 1
+        out.append((m.group(1) or "", m.group(2), [a.strip() for a in args if a.strip()]))
+    return out
+
+
+def _root(arg: str) -> str:
+    """Имя, с которого начинается аргумент: `Черновик.Вложения` → `Черновик`; `Имя = Х` → `Х`."""
+    value = arg.split("=", 1)[1].strip() if re.match(r"^\w+\s*=(?!=)", arg) else arg
+    m = re.match(r"^(\w+)(?:\s*[!?]?\.\s*\w+)*\s*[!?]?$", value)
+    return m.group(1) if m else ""
+
+
+def _guarded(body: str, name: str) -> bool:
+    """Предел: сравнение `Имя….Размер()` или самого `Имя` с чем-либо в условии, `Мин(…Имя…)`."""
+    path = rf"(?<![\w.]){re.escape(name)}(?:\s*[!?]?\.\s*\w+)*"
+    size = rf"{path}\s*[!?]?\.\s*(?:Размер|Количество|Size|Count)\s*\(\s*\)"
+    for line in body.splitlines():
+        if not _CONDITION_LINE.search(line):
+            continue
+        if re.search(rf"{size}\s*(?:<=?|>=?)|(?:<=?|>=?)\s*{size}", line):
+            return True
+        if re.search(rf"{path}\s*(?:<=?|>=?)(?!-)|(?<!-)(?:<=?|>=?)\s*{path}(?![\w.(])", line):
+            return True
+    return bool(re.search(rf"(?:Мин|Min)\s*\([^)]*{path}", body))
+
+
+def unbounded_methods(paths: list[str]) -> dict[str, str]:
+    """Методы — точки входа значения извне, у которых оно задаёт границу работы без предела
+    (для ПР-09): `Модуль.Метод:строка` → что и где; перегрузки различаются строкой.
+
+    Сток — цикл по параметру (`для … из Параметр…`, `Параметр….ДляКаждого(…)`) или до числа
+    из параметра (`для … по Параметр`), в витке которого обращение к данным или наружу, либо
+    `ПЕРВЫЕ %Параметр`; дальше набор замыкается по вызовам: метод, передающий свой параметр
+    (или его поле) в параметр-сток, сам сток. Предел — сравнение размера или числа в условии,
+    `Мин(…)` — в методе снимает сток. Точки входа — серверный метод с доступом с клиента
+    с параметром-стоком и обработчик HTTP-сервиса, который передаёт в сток данные запроса
+    (параметры, заголовки, тело, в том числе разобранное) или сам их перебирает.
+    """
+    bodies, _ = _bodies(paths)
+    methods = _methods(paths)
+    by_name: dict[str, list[int]] = {}
+    for idx, (key, *_rest) in enumerate(methods):
+        by_name.setdefault(key, []).append(idx)
+    accessing = {k for k, lines in bodies.items() if _STEP_ACCESS.search("\n".join(lines))}
+    accessing = _closure(accessing, bodies)
+
+    def step_access(lines: list[str], own: str) -> bool:
+        text = "\n".join(lines)
+        return bool(_STEP_ACCESS.search(text)) or any(
+            f"{q or own}.{n}" in accessing for q, n in _CALL.findall(text))
+
+    def direct(lines: list[str], own: str, names: set[str]) -> dict[str, str]:
+        found: dict[str, str] = {}
+        for n, line in enumerate(lines):
+            for rx in (_LOOP_OVER, _LOOP_TO):
+                m = rx.match(line)
+                if m and m.group(1) in names and step_access(_loop_body(lines, n), own):
+                    found.setdefault(m.group(1), f"цикл по '{m.group(1)}{re.sub(chr(32), '', m.group(2))}'")
+            for m in _FOR_EACH.finditer(line):
+                if m.group(1) in names and step_access([line[m.end():]], own):
+                    found.setdefault(m.group(1), f"цикл по '{m.group(1)}{re.sub(chr(32), '', m.group(2))}'")
+            for m in _TOP_N.finditer(line):
+                if m.group(1) in names:
+                    found.setdefault(m.group(1), f"'ПЕРВЫЕ %{m.group(1)}'")
+        return found
+
+    sinks: dict[int, dict[str, str]] = {}
+    for idx, (key, _line, names, _ann, _header, lines) in enumerate(methods):
+        found = direct(lines, key.split(".")[0], set(names))
+        text = "\n".join(lines)
+        found = {p: w for p, w in found.items() if not _guarded(text, p)}
+        if found:
+            sinks[idx] = {p: f"{w} в {key}" for p, w in found.items()}
+
+    def passed(lines: list[str], own: str, tainted: set[str], request: str | None) -> dict[str, str]:
+        found: dict[str, str] = {}
+        text = "\n".join(lines)
+        for q, n, args in _arguments(text):
+            for callee in by_name.get(f"{q or own}.{n}", []):
+                if callee not in sinks:
+                    continue
+                params = methods[callee][2]
+                for i, arg in enumerate(args):
+                    named = re.match(r"^(\w+)\s*=(?!=)", arg)
+                    param = named.group(1) if named else (params[i] if i < len(params) else "")
+                    if param not in sinks[callee]:
+                        continue
+                    root = _root(arg)
+                    if root in tainted:
+                        found.setdefault(root, sinks[callee][param])
+                    elif request and request in arg and _REQUEST_DATA.search(arg):
+                        found.setdefault(request, sinks[callee][param])
+        return found
+
+    changed = True
+    while changed:
+        changed = False
+        for idx, (key, _line, names, _ann, _header, lines) in enumerate(methods):
+            text = "\n".join(lines)
+            for p, w in passed(lines, key.split(".")[0], set(names), None).items():
+                if p not in sinks.get(idx, {}) and not _guarded(text, p):
+                    sinks.setdefault(idx, {})[p] = w
+                    changed = True
+
+    admins = admin_methods(paths)
+    entries: dict[str, str] = {}
+    for idx, (key, line, names, ann, header, lines) in enumerate(methods):
+        own = key.split(".")[0]
+        text = "\n".join(lines)
+        if any(f"{q or own}.{n}" in admins for q, n in _CALL.findall(text)):
+            continue
+        if ann & _ON_SERVER and ann & _FROM_CLIENT and idx in sinks:
+            p, w = next(iter(sorted(sinks[idx].items())))
+            entries[f"{key}:{line}"] = f"параметр '{p}' с клиента: {w}"
+            continue
+        http = _HTTP_REQUEST.search(header)
+        if not http:
+            continue
+        request = http.group(1)
+        tainted = {m.group(1) for line in lines if (m := _LOCAL.match(line))
+                   and request in m.group(2) and _REQUEST_DATA.search(m.group(2))}
+        found = direct(lines, own, tainted)
+        found = {p: f"{w} в {key}" for p, w in found.items() if not _guarded(text, p)}
+        found.update({p: w for p, w in passed(lines, own, tainted, request).items()
+                      if not _guarded(text, p)})
+        if found:
+            p, w = next(iter(sorted(found.items())))
+            entries[f"{key}:{line}"] = f"данные запроса ('{p}'): {w}"
+    return entries
+
+
 def journaled_methods(paths: list[str], journal: list[str]) -> set[str]:
     """Методы, которые пишут журнал доступа ПДн (для ПР-07): сами зовут метод журнала
     или зовут такой метод — набор замыкается по вызовам, как у `identity_methods`."""
@@ -240,7 +469,8 @@ def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                 max_accesses: str = "", unguarded_file: Path | None = None,
                 pd: dict[str, str] | None = None,
                 admin_file: Path | None = None,
-                upload_file: Path | None = None) -> list[report.Finding]:
+                upload_file: Path | None = None,
+                unbounded_file: Path | None = None) -> list[report.Finding]:
     cmd = [sys.executable, "-m", "xbsl", "--data-dir", str(data_dir), "--lang", "ru",
            "--select", ",".join(rules), "--format", "json", *paths]
     env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths))),
@@ -250,6 +480,7 @@ def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                               UNGUARDED_ENV: str(unguarded_file or ""),
                               ADMIN_ENV: str(admin_file or ""),
                               UPLOAD_ENV: str(upload_file or ""),
+                              UNBOUNDED_ENV: str(unbounded_file or ""),
                               MIN_PERIOD_ENV: min_period,
                               MAX_ACCESSES_ENV: max_accesses, **(pd or {})})
     done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
@@ -285,6 +516,9 @@ def _check(args) -> int:
         admin_file.write_text("\n".join(sorted(admin_methods(args.paths))), encoding="utf-8")
         upload_file = Path(tmp) / "upload.txt"
         upload_file.write_text("\n".join(sorted(upload_methods(args.paths))), encoding="utf-8")
+        unbounded_file = Path(tmp) / "unbounded.txt"
+        unbounded_file.write_text("\n".join(f"{k}\t{v}" for k, v in sorted(unbounded_methods(args.paths).items())),
+                                  encoding="utf-8")
         pd_names = list(filter(None, (args.pd_entities or "").split(",")))
         journal = list(filter(None, (args.pd_journal or "").split(",")))
         journaled_file = Path(tmp) / "journaled.txt"
@@ -296,7 +530,7 @@ def _check(args) -> int:
         findings = _run_engine(args.paths, data_dir, rules, args.sanitizers or "",
                                args.min_period or "", server_file, data_file,
                                args.max_accesses or "", unguarded_file, pd, admin_file,
-                               upload_file)
+                               upload_file, unbounded_file)
     report.apply_exceptions(findings, root)
     if args.perimeter:
         report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))

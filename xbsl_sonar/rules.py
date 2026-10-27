@@ -427,6 +427,45 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-434",
         effort_minutes=20,
     ),
+    "ПР-09": RuleText(
+        code="ПР-09",
+        name="Граница работы из значения извне без предела",
+        description=(
+            "<p>Сколько раз сервер обратится к базе или наружу, решает значение, пришедшее "
+            "извне: список с клиента, поле тела HTTP-запроса, число из параметра. Предела нет — "
+            "один запрос со списком в миллион элементов заставит сервер сделать миллион чтений "
+            "или записей. Ограничения интерфейса работают только на клиенте: прямой вызов метода "
+            "или HTTP-запрос их обходят.</p>"
+            "<p><b>Находка</b> — точка входа, откуда значение извне доходит до стока:</p><ul>"
+            "<li>точка входа — метод <code>@НаСервере @ДоступноСКлиента</code> (значение — его "
+            "параметр) или обработчик HTTP-сервиса (значение — <code>Запрос.Параметры</code>, "
+            "<code>Заголовки</code>, <code>Тело</code>, в том числе разобранное "
+            "<code>СериализацияJson.ПрочитатьОбъект</code>, и поля разобранного);</li>"
+            "<li>сток — цикл по значению (<code>для … из</code>, <code>.ДляКаждого(…)</code>) или до "
+            "числа из него (<code>для … по</code>), в витке которого запрос, "
+            "<code>ЗагрузитьОбъект</code>/<code>ЗагрузитьЗапись</code>, <code>Записать</code>, "
+            "<code>Удалить</code>, отправка письма или HTTP-запроса либо вызов метода, который так "
+            "делает; или <code>ПЕРВЫЕ %Значение</code>. Значение может дойти до стока через вызовы — "
+            "параметром или полем параметра.</li></ul>"
+            "<p><b>Предел</b> — сравнение <code>.Размер()</code> или числа в условии "
+            "(<code>если Список.Размер() > 100</code>) либо <code>Мин(…)</code> в методе на пути "
+            "от входа до стока.</p>"
+            "<p><b>Не находка:</b> <code>ПЕРВЫЕ</code> литералом; число из запроса только в условии "
+            "отбора; цикл без обращения к данным (преобразование, сборка массива); список "
+            "в условии <code>В (%Список)</code> одного запроса; метод, который сверяет "
+            "администратора, сам или в вызываемых; метод без доступа с клиента — его границу "
+            "задаёт вызывающий.</p>"
+            "<p><b>Как исправить:</b> до цикла сравнить размер списка с пределом и отказать "
+            "(исключение, код ответа 400), либо собрать значения в один запрос "
+            "<code>В (%Список)</code> вместо обращения в каждом витке.</p>"
+            "<p>CWE-606: Unchecked Input for Loop Condition; CWE-789: Memory Allocation with "
+            "Excessive Size Value; CWE-400: Uncontrolled Resource Consumption. OWASP A04.</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MAJOR",
+        cwe="CWE-606",
+        effort_minutes=15,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -471,6 +510,9 @@ ADMIN_ENV = "XBSL_SONAR_ADMIN"
 # (`ЗагрузкаФайлов.НачатьЗагрузку`, `ПриЗагрузкеФайла`) и дальше по вызовам; набор собирает
 # `check` (`upload_methods`) и кладёт файлом. Здесь — путь к этому файлу.
 UPLOAD_ENV = "XBSL_SONAR_UPLOAD"
+# Точки входа значения извне без предела (для ПР-09): `Модуль.Метод:строка<TAB>что и где` по строке;
+# собирает `cli.unbounded_methods` по всему проекту
+UNBOUNDED_ENV = "XBSL_SONAR_UNBOUNDED"
 # Порог обращений к серверу и базе в обработчике формы для ПР-17 — параметр `--max-accesses`.
 MAX_ACCESSES_ENV = "XBSL_SONAR_MAX_ACCESSES"
 DEFAULT_MAX_ACCESSES = 3
@@ -1959,3 +2001,32 @@ def file_upload(source: SourceFile) -> Iterable[Diagnostic]:
             f"размер с пределом и проверить тип до сохранения или разбора.",
         ))
     return out + _form_uploads(source)
+
+
+def _entry_map(env: str) -> dict[str, str]:
+    """`Модуль.Метод:строка` → пояснение из файла, путь к которому — в переменной окружения env."""
+    out: dict[str, str] = {}
+    for line in _key_set(env):
+        key, _, why = line.partition("\t")
+        out[key] = why
+    return out
+
+
+@rule("ПР-09", "Граница работы из значения извне без предела", "S", severity=Severity.WARNING)
+def unbounded_input(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    own = source.path.name.split(".")[0]
+    entries = _entry_map(UNBOUNDED_ENV)
+    out: list[Diagnostic] = []
+    for name, line, _ann, _header, _lines in _methods_with_headers(source.text):
+        why = entries.get(f"{own}.{name}:{line}")
+        if why is None:
+            continue
+        out.append(Diagnostic(
+            source.rel, line, 1, "ПР-09", Severity.WARNING,
+            f"Метод '{name}': {why} — без предела. Один вызов со списком любой длины даёт "
+            f"столько же обращений к данным. Сравнить размер с пределом и отказать до цикла "
+            f"или собрать значения в один запрос.",
+        ))
+    return out

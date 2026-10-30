@@ -466,6 +466,32 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-606",
         effort_minutes=15,
     ),
+    "ПР-10": RuleText(
+        code="ПР-10",
+        name="Ошибка поймана и отпущена молча",
+        description=(
+            "<p>Блок <code>поймать</code> ничего не делает с ошибкой: в его теле только "
+            "<code>возврат</code> без значения, <code>продолжить</code> или "
+            "<code>прервать</code> (или ничего), и нет комментария, почему ошибку можно "
+            "отпустить. Сбой исчезает бесследно: его нет ни в журнале событий, ни у вызывающего, "
+            "ни у пользователя, и узнают о нём по последствиям.</p>"
+            "<p><b>Находка:</b> <code>поймать</code> любого типа исключения с таким телом.</p>"
+            "<p><b>Не находка:</b> повторный выброс, запись в журнал, передача исключения "
+            "дальше (<code>ОшибкаСервиса(Запрос, \"Ping\", Исключение)</code>), показ "
+            "пользователю; возврат значения-заменителя (<code>возврат Неопределено</code>) "
+            "или присваивание значения по умолчанию — вызывающий получает «нет значения» "
+            "и решает сам; тело с комментарием, объясняющим, почему ошибку можно отпустить.</p>"
+            "<p><b>Как исправить:</b> записать ошибку в журнал событий или передать её дальше; "
+            "если отпустить её правильно — сказать почему комментарием в теле блока.</p>"
+            "<p>CWE-390: Detection of Error Condition Without Action; CWE-252: Unchecked Return "
+            "Value; CWE-703: Improper Check or Handling of Exceptional Conditions "
+            "(ISO/IEC 5055, надёжность и безопасность). OWASP A09.</p>"
+        ),
+        type="CODE_SMELL",
+        severity="MAJOR",
+        cwe="CWE-390",
+        effort_minutes=10,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2029,4 +2055,67 @@ def unbounded_input(source: SourceFile) -> Iterable[Diagnostic]:
             f"столько же обращений к данным. Сравнить размер с пределом и отказать до цикла "
             f"или собрать значения в один запрос.",
         ))
+    return out
+
+
+# ПР-10: блок `поймать`, в котором с ошибкой ничего не сделано.
+_BARE = {"RETURN", "CONTINUE", "BREAK"}
+
+
+def _comment_between(text: str, first: int, last: int) -> bool:
+    """Есть ли строка-комментарий среди строк first..last (нумерация с 1)."""
+    lines = text.split("\n")
+    return any(line.lstrip().startswith("//") for line in lines[first - 1:last])
+
+
+@rule("ПР-10", "Ошибка поймана и отпущена молча", "D", severity=Severity.WARNING)
+def swallowed_exception(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    toks = code_tokens(source)
+    out: list[Diagnostic] = []
+
+    def close(c: int, end: int) -> None:
+        """Тело `поймать` с токена c до токена end (следующий `поймать`, `вконце` или `;`)."""
+        body = [b for b in toks[c + 1:end] if b.line > toks[c].line]
+        if not all(b.kind == "KEYWORD" and b.canonical in _BARE for b in body):
+            return
+        if _comment_between(source.text, toks[c].line + 1, toks[end].line - 1):
+            return
+        out.append(Diagnostic(
+            source.rel, toks[c].line, toks[c].col, "ПР-10", Severity.WARNING,
+            "Ошибка поймана и отпущена молча: в блоке 'поймать' с ней ничего не сделано. "
+            "Записать в журнал событий или передать дальше; если отпустить правильно – "
+            "объяснить комментарием в теле блока.",
+        ))
+
+    depth = 0  # глубина блоков: `поймать` относится к `попытка` той же глубины
+    tries: list[int] = []  # глубины открытых `попытка`
+    pending: dict[int, int] = {}  # глубина попытки -> индекс её последнего `поймать`
+    prev = None
+    for i, t in enumerate(toks):
+        at_try = bool(tries) and tries[-1] == depth
+        if t.kind == "KEYWORD" and t.canonical in _OPENERS and t.value[:1].islower():
+            is_else_if = (t.canonical == "IF" and prev is not None and prev.kind == "KEYWORD"
+                          and prev.canonical == "ELSE" and prev.line == t.line)
+            is_abstract = (t.canonical == "METHOD" and prev is not None and prev.kind == "KEYWORD"
+                           and prev.canonical == "ABSTRACT")
+            if not is_else_if and not is_abstract:
+                depth += 1
+                if t.canonical == "TRY":
+                    tries.append(depth)
+        elif t.kind == "KEYWORD" and t.canonical in ("CATCH", "FINALLY") and at_try:
+            c = pending.pop(depth, None)
+            if c is not None:
+                close(c, i)
+            if t.canonical == "CATCH":
+                pending[depth] = i
+        elif t.kind == "OP" and t.value == ";":
+            if at_try:
+                tries.pop()
+                c = pending.pop(depth, None)
+                if c is not None:
+                    close(c, i)
+            depth = max(depth - 1, 0)
+        prev = t
     return out

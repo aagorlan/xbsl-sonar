@@ -492,6 +492,36 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-390",
         effort_minutes=10,
     ),
+    "ПР-18": RuleText(
+        code="ПР-18",
+        name="ПОДОБНО с шаблоном от начала строки",
+        description=(
+            "<p>Шаблон <code>ПОДОБНО</code> начинается с <code>%</code> или <code>_</code>: "
+            "начало строки неизвестно, и индекс по полю не помогает — запрос перебирает всю "
+            "таблицу. На маленьких данных это незаметно, с ростом таблицы запрос замедляется "
+            "вместе с ней.</p>"
+            "<p><b>Находка:</b></p><ul>"
+            "<li>в тексте запроса (<code>Запрос{…}</code> или файл <code>.xbql</code>) "
+            "<code>ПОДОБНО \"%…\"</code> или <code>ПОДОБНО \"_…\"</code>, в том числе "
+            "с <code>НЕ</code>;</li>"
+            "<li><code>ПОДОБНО %Шаблон</code>, когда в том же модуле параметру присваивается "
+            "строка, начинающаяся с <code>%</code> или <code>_</code> "
+            "(<code>Шаблон = \"%\" + Текст + \"%\"</code>); <code>ПОДОБНО %{\"%\" + …}</code>.</li>"
+            "</ul><p><b>Не находка:</b> шаблон с известным началом "
+            "(<code>ПОДОБНО \"Версия%\"</code>) — индекс работает; параметр, значение которого "
+            "в модуле не видно (параметр виртуальной таблицы, аргумент метода); проверка "
+            "вхождения <code>Содержит()</code> вне запроса.</p>"
+            "<p><b>Как исправить:</b> искать по началу строки (<code>\"Текст%\"</code>), "
+            "по точному значению или по отдельному полю для поиска; если нужен поиск подстроки — "
+            "полнотекстовый поиск платформы.</p>"
+            "<p>CWE-1067: Excessive Execution of Sequential Searches of Data Resource "
+            "(ISO/IEC 5055, производительность).</p>"
+        ),
+        type="CODE_SMELL",
+        severity="MAJOR",
+        cwe="CWE-1067",
+        effort_minutes=15,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2118,4 +2148,37 @@ def swallowed_exception(source: SourceFile) -> Iterable[Diagnostic]:
                     close(c, i)
             depth = max(depth - 1, 0)
         prev = t
+    return out
+
+
+# ПР-18: шаблон ПОДОБНО, начало которого неизвестно, — индекс по полю не работает.
+_LIKE = re.compile(r'\b(?:ПОДОБНО|LIKE)\s+(?:"([%_])|%\{\s*"([%_])|[%&](\w+))', re.IGNORECASE)
+
+
+def _leading_wildcard_params(text: str) -> set[str]:
+    """Имена, которым в модуле присваивается строка, начинающаяся с `%` или `_`."""
+    return {m.group(1) for m in re.finditer(r'(\w+)\s*=\s*"[%_]', text)}
+
+
+@rule("ПР-18", "ПОДОБНО с шаблоном от начала строки", "D", severity=Severity.WARNING)
+def like_leading_wildcard(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    wild = _leading_wildcard_params(source.text)
+    out: list[Diagnostic] = []
+    for start, end in query_ranges(source):
+        for m in _LIKE.finditer(source.text, start, end):
+            line_start = source.text.rfind("\n", 0, m.start()) + 1
+            if "//" in source.text[line_start:m.start()]:
+                continue
+            param = m.group(3)
+            if param is not None and param not in wild:
+                continue
+            line = source.text.count("\n", 0, m.start()) + 1
+            what = f"параметр '{param}' начинается с подстановки" if param else "шаблон начинается с подстановки"
+            out.append(Diagnostic(
+                source.rel, line, m.start() - line_start + 1, "ПР-18", Severity.WARNING,
+                f"ПОДОБНО: {what} — индекс по полю не работает, запрос перебирает всю таблицу. "
+                f"Искать по началу строки, по точному значению или полнотекстовым поиском.",
+            ))
     return out

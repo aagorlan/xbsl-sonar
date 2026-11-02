@@ -522,6 +522,35 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-1067",
         effort_minutes=15,
     ),
+    "ПР-11": RuleText(
+        code="ПР-11",
+        name="Адрес HTTP-запроса из данных пользователя",
+        description=(
+            "<p>Сервер отправляет HTTP-запрос по адресу, который задал пользователь: параметр "
+            "метода с доступом с клиента, запрос к HTTP-сервису или реквизит хранимого объекта. "
+            "Так сервер приложения ходит туда, куда скажет пользователь, — во внутреннюю сеть, "
+            "к служебным адресам облака, по кругу к себе (подделка запроса со стороны сервера).</p>"
+            "<p><b>Находка:</b> первый аргумент <code>СБазовымUrl</code>, <code>ЗапросGet</code>, "
+            "<code>ЗапросPost</code>, <code>ЗапросPut</code>, <code>ЗапросPatch</code>, "
+            "<code>ЗапросDelete</code>, <code>ЗапросHead</code>, <code>ЗапросOptions</code>, "
+            "<code>ЗапросTrace</code>, <code>ЗапросConnect</code> или второй аргумент "
+            "<code>КлиентHttp.СоздатьЗапрос</code>, если в нём:</p><ul>"
+            "<li>параметр метода с <code>@ДоступноСКлиента</code> или параметр типа "
+            "<code>HttpСервисЗапрос</code> — прямо или через локальную переменную;</li>"
+            "<li>реквизит хранимого объекта — <code>…Объект.Поле</code>, <code>…Ссылка.Поле</code>, "
+            "<code>…Запись.Поле</code>.</li></ul>"
+            "<p><b>Не находка:</b> строковый литерал, в том числе с подстановкой; вызов метода "
+            "без параметров (<code>АдресСервера()</code>); константа; параметр серверного метода "
+            "без доступа с клиента — адрес ему выбирает код.</p>"
+            "<p><b>Как исправить:</b> не ходить по адресу пользователя, если достаточно показать "
+            "его; иначе сверять хост с перечнем разрешённых до запроса.</p>"
+            "<p>CWE-918: Server-Side Request Forgery (OWASP Top 10 2021, A10).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MAJOR",
+        cwe="CWE-918",
+        effort_minutes=20,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2181,4 +2210,105 @@ def like_leading_wildcard(source: SourceFile) -> Iterable[Diagnostic]:
                 f"ПОДОБНО: {what} — индекс по полю не работает, запрос перебирает всю таблицу. "
                 f"Искать по началу строки, по точному значению или полнотекстовым поиском.",
             ))
+    return out
+
+
+# ПР-11: адрес HTTP-запроса из данных пользователя.
+_HTTP_URL_METHODS = ("СБазовымUrl", "ЗапросGet", "ЗапросPost", "ЗапросPut", "ЗапросPatch",
+                     "ЗапросDelete", "ЗапросHead", "ЗапросOptions", "ЗапросTrace", "ЗапросConnect")
+_HTTP_URL_CALL = re.compile(r"(?<![\w])(" + "|".join(_HTTP_URL_METHODS) + r"|СоздатьЗапрос)\s*\(")
+_STORED_FIELD = re.compile(r"(?<![\w.])\w*(?:Объект|Ссылка|Запись)\.\w+(?![\w(]|\s*\()")
+_ASSIGN = re.compile(r"^\s*(?:(?:знч|пер|исп)\s+)?(\w+)(?:\s*:\s*[^=]+?)?\s*=(?!=)\s*(.+)$")
+_PARAM_NAME = re.compile(r"[(,]\s*(\w+)\s*:")
+
+
+def _call_args(text: str, open_paren: int) -> list[str]:
+    """Аргументы вызова верхнего уровня, начиная со скобки open_paren."""
+    depth, args, start, i, quote = 0, [], open_paren + 1, open_paren, False
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            quote = not quote
+        elif not quote:
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+                if depth == 0:
+                    args.append(text[start:i])
+                    return args
+            elif c == "," and depth == 1:
+                args.append(text[start:i])
+                start = i + 1
+        i += 1
+    return args
+
+
+def _code_part(line: str) -> str:
+    """Строка без комментария `//`; `//` внутри строкового литерала комментарием не считается."""
+    quote = False
+    for i, c in enumerate(line):
+        if c == '"':
+            quote = not quote
+        elif not quote and line.startswith("//", i):
+            return line[:i]
+    return line
+
+
+def _strip_literals(expr: str) -> str:
+    return re.sub(r'"[^"]*"', '""', expr)
+
+
+_FIXED_HOST = re.compile(r'^\s*"[a-zA-Z]+://[^"/%]+/')
+
+
+def _tainted_by(expr: str, tainted: dict[str, str]) -> str | None:
+    if _FIXED_HOST.match(expr):
+        return None
+    expr = _strip_literals(expr)
+    for name, why in tainted.items():
+        if re.search(rf"(?<![\w.]){re.escape(name)}(?![\w])", expr):
+            return why
+    m = _STORED_FIELD.search(expr)
+    if m:
+        return f"реквизит хранимого объекта {m.group(0)}"
+    return None
+
+
+@rule("ПР-11", "Адрес HTTP-запроса из данных пользователя", "S", severity=Severity.WARNING)
+def http_url_from_user(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, ann, header, lines in _methods_with_headers(source.text):
+        tainted: dict[str, str] = {}
+        if ann & _FROM_CLIENT:
+            for p in _PARAM_NAME.findall(header):
+                tainted[p] = f"параметр {p} приходит с клиента"
+        for p in _HTTP_PARAM.findall(header):
+            tainted[p] = f"параметр {p} — запрос к HTTP-сервису"
+        for k, text_line in enumerate(lines, line + 1):
+            code = _code_part(text_line)
+            for m in _HTTP_URL_CALL.finditer(code):
+                method = m.group(1)
+                if method == "СоздатьЗапрос" and "КлиентHttp" not in "\n".join(lines[:k - line - 1])[-400:] + code:
+                    continue
+                args = _call_args(code, m.end() - 1)
+                index = 1 if method == "СоздатьЗапрос" else 0
+                if len(args) <= index:
+                    continue
+                why = _tainted_by(args[index], tainted)
+                if why is None:
+                    continue
+                out.append(Diagnostic(
+                    source.rel, k, m.start() + 1, "ПР-11", Severity.WARNING,
+                    f"Метод '{name}': адрес {method} — из данных пользователя ({why}). Сервер "
+                    f"пойдёт туда, куда скажет пользователь, в том числе во внутреннюю сеть. "
+                    f"Не ходить по такому адресу или сверять хост с перечнем разрешённых.",
+                ))
+            a = _ASSIGN.match(code)
+            if a and a.group(1) not in tainted:
+                why = _tainted_by(a.group(2), tainted)
+                if why is not None:
+                    tainted[a.group(1)] = why
     return out

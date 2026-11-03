@@ -551,6 +551,39 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-918",
         effort_minutes=20,
     ),
+    "ПР-12": RuleText(
+        code="ПР-12",
+        name="Внешний JSON без проверки структуры",
+        description=(
+            "<p>JSON из внешнего источника — тело ответа HTTP, тело запроса к HTTP-сервису, "
+            "сохранённое тело вызова — читается в нетипизированное соответствие, и дальше "
+            "значения берутся вслепую: приводятся <code>как</code> к ожидаемому типу или читаются "
+            "<code>Получить</code> без проверки ключа. Ответ другой формы (ошибка сервиса, "
+            "изменённый протокол, подложенный запрос) роняет метод исключением приведения "
+            "в произвольном месте, а то и передаёт дальше значение не того вида.</p>"
+            "<p><b>Находка:</b> <code>СериализацияJson.ПрочитатьОбъект</code>, у которого первый "
+            "аргумент содержит <code>.Тело</code> или <code>ТелоЗапроса</code> (прямо или через "
+            "локальную переменную, в том числе ответ <code>…Выполнить()</code>), второй — "
+            "<code>Тип&lt;Соответствие&lt;Строка, Объект…&gt;&gt;</code>, "
+            "<code>Тип&lt;Соответствие&lt;Строка, неизвестно&gt;&gt;</code>, <code>Тип&lt;Объект…&gt;</code> "
+            "или <code>Тип&lt;Массив&lt;Объект…&gt;&gt;</code>, а результат в том же методе "
+            "приводится <code>как</code> или читается <code>Получить(…)</code> без "
+            "<code>СодержитКлюч</code>; вызов не внутри <code>попытка</code>.</p>"
+            "<p><b>Не находка:</b> чтение в свою структуру (<code>Тип&lt;ПакетКаталога&gt;</code>) — "
+            "структуру проверяет платформа и бросает исключение сразу; чтение своих данных "
+            "(файл настроек, ресурс) — источник без <code>.Тело</code>; результат, который не "
+            "разбирается в методе (сразу записывается обратно в JSON); вызов внутри "
+            "<code>попытка</code>.</p>"
+            "<p><b>Как исправить:</b> описать ответ структурой и читать в неё; если формат "
+            "свободный — проверять ключи и тип значения до приведения (<code>это</code>) "
+            "или читать внутри <code>попытка</code> с понятной ошибкой.</p>"
+            "<p>CWE-502: Deserialization of Untrusted Data (ISO/IEC 5055, безопасность).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MINOR",
+        cwe="CWE-502",
+        effort_minutes=20,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2312,3 +2345,77 @@ def http_url_from_user(source: SourceFile) -> Iterable[Diagnostic]:
                 if why is not None:
                     tainted[a.group(1)] = why
     return out
+
+
+# ПР-12: внешний JSON без проверки структуры.
+_JSON_READ = re.compile(r"СериализацияJson\.ПрочитатьОбъект\s*\(")
+_EXTERNAL_BODY = re.compile(r"\.Тело(?![\w])|(?<![\w])ТелоЗапроса(?![\w])|\.Выполнить\s*\(\s*\)")
+_UNTYPED = re.compile(r"Тип\s*<\s*(?:Соответствие\s*<\s*Строка\s*,\s*(?:Объект|неизвестно)|Объект|Массив\s*<\s*Объект)")
+_TRY_OPEN = re.compile(r"^\s*попытка\s*$")
+_TRY_CLOSE = re.compile(r"^\s*(?:поймать|вконце)\b")
+
+
+def _external_source(expr: str, external: set[str]) -> bool:
+    expr = _strip_literals(expr)
+    if _EXTERNAL_BODY.search(expr):
+        return True
+    return any(re.search(rf"(?<![\w.]){re.escape(n)}(?![\w])", expr) for n in external)
+
+
+@rule("ПР-12", "Внешний JSON без проверки структуры", "S", severity=Severity.WARNING)
+def json_without_structure(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, _ann, header, lines in _methods_with_headers(source.text):
+        external: set[str] = set(_HTTP_PARAM.findall(header))
+        tries = 0
+        for idx, text_line in enumerate(lines):
+            k = line + 1 + idx
+            code = _code_part(text_line)
+            if _TRY_OPEN.match(code):
+                tries += 1
+            elif _TRY_CLOSE.match(code) and tries > 0:
+                tries -= 1
+            # Вызов может переноситься: собрать продолжение до закрывающей скобки
+            joined = code
+            m = _JSON_READ.search(joined)
+            extra = 0
+            while m and joined.count("(") > joined.count(")") and idx + extra + 1 < len(lines):
+                extra += 1
+                joined += " " + _code_part(lines[idx + extra]).strip()
+            a = _ASSIGN.match(code)
+            if m is None:
+                if a and a.group(1) not in external and _external_source(a.group(2), external):
+                    external.add(a.group(1))
+                continue
+            args = _call_args(joined, joined.find("(", m.start()))
+            if len(args) < 2 or tries > 0:
+                continue
+            # Запятая внутри `Тип<Соответствие<Строка, Объект>>` делит аргумент: тип — весь хвост
+            if not _external_source(args[0], external) or not _UNTYPED.search(",".join(args[1:])):
+                continue
+            if a is None and idx > 0:
+                prev = re.match(r"^\s*(?:(?:знч|пер)\s+)?(\w+)(?:\s*:\s*[^=]+?)?\s*=\s*$", _code_part(lines[idx - 1]))
+                result = prev.group(1) if prev else None
+            else:
+                result = a.group(1) if a else None
+            if result is None:
+                continue
+            rest = "\n".join(_code_part(x) for x in lines[idx + extra + 1:])
+            if not re.search(rf"(?<![\w.]){re.escape(result)}(?![\w])", rest):
+                continue
+            uses = rest
+            cast = re.search(r"\sкак\s", uses) is not None
+            blind_get = (re.search(rf"(?<![\w.]){re.escape(result)}\.Получить\s*\(", uses) is not None
+                         and re.search(rf"(?<![\w.]){re.escape(result)}\.СодержитКлюч\s*\(", uses) is None)
+            if not (cast or blind_get):
+                continue
+            out.append(Diagnostic(
+                source.rel, k, m.start() + 1, "ПР-12", Severity.WARNING,
+                f"Метод '{name}': внешний JSON читается в нетипизированное значение '{result}' "
+                f"и разбирается без проверки структуры. Описать ответ структурой и читать в неё "
+                f"или проверять ключи и тип значения до приведения.",
+            ))
+    return out
+

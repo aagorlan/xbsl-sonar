@@ -584,6 +584,31 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-502",
         effort_minutes=20,
     ),
+    "ПР-13": RuleText(
+        code="ПР-13",
+        name="Текст запроса из строк",
+        description=(
+            "<p>Текст запроса собирается из строк: сложением, интерполяцией <code>%{…}</code> "
+            "или <code>%Имя</code> в обычной строке, из переменной или результата метода. "
+            "Значение, попавшее в такой текст, становится частью запроса — отсюда внедрение "
+            "(<code>ГДЕ Заголовок ПОДОБНО \"…\"</code> со строкой пользователя), а платформа "
+            "не видит текст при сборке и не проверяет его.</p>"
+            "<p><b>Находка:</b> <code>новый Запрос(…)</code> и присваивание <code>….Текст = …</code> "
+            "переменной, созданной как <code>новый Запрос</code>, если аргумент или значение — не один "
+            "строковый литерал без <code>%</code>.</p>"
+            "<p><b>Не находка:</b> литерал <code>Запрос{ … }</code> с параметрами <code>%Имя</code> и "
+            "<code>%{выражение}</code> — это параметры запроса, а не склейка; "
+            "<code>новый Запрос(\"…\")</code> с одним литералом без <code>%</code>.</p>"
+            "<p><b>Как исправить:</b> писать запрос литералом <code>Запрос{ … }</code>, значения — "
+            "параметрами; меняющуюся часть — условием с параметром, а не вставкой в текст.</p>"
+            "<p>CWE-89: Improper Neutralization of Special Elements used in an SQL Command "
+            "(ISO/IEC 5055, безопасность).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MAJOR",
+        cwe="CWE-89",
+        effort_minutes=15,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2419,3 +2444,56 @@ def json_without_structure(source: SourceFile) -> Iterable[Diagnostic]:
             ))
     return out
 
+
+# ПР-13: текст запроса, собранный из строк.
+_NEW_QUERY = re.compile(r"(?<![\w.])новый\s+Запрос\s*\(")
+_SINGLE_LITERAL = re.compile(r'^\s*"[^"%]*"\s*$', re.S)
+
+
+def _built_text(expr: str) -> bool:
+    """Истина — текст не один строковый литерал без интерполяции."""
+    return _SINGLE_LITERAL.match(expr) is None
+
+
+@rule("ПР-13", "Текст запроса из строк", "S", severity=Severity.WARNING)
+def query_text_from_strings(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, _ann, _header, lines in _methods_with_headers(source.text):
+        queries: set[str] = set()
+        for idx, text_line in enumerate(lines):
+            k = line + 1 + idx
+            code = _code_part(text_line)
+            m = _NEW_QUERY.search(code)
+            if m:
+                # Вызов может переноситься, строковый литерал — тоже: собрать до закрывающей скобки
+                joined, extra = code, 0
+                while (joined.count("(") > joined.count(")") or joined.count('"') % 2) \
+                        and idx + extra + 1 < len(lines):
+                    extra += 1
+                    joined += "\n" + lines[idx + extra]
+                args = _call_args(joined, joined.find("(", m.start()))
+                a = _ASSIGN.match(code)
+                if a:
+                    queries.add(a.group(1))
+                if args and args[0].strip() and _built_text(args[0]):
+                    out.append(Diagnostic(
+                        source.rel, k, m.start() + 1, "ПР-13", Severity.WARNING,
+                        f"Метод '{name}': текст запроса собирается из строк. Писать запрос "
+                        f"литералом Запрос{{ … }}, значения — параметрами.",
+                    ))
+                continue
+            t = re.match(r"^\s*(\w+)\.Текст\s*=(?!=)\s*(.*)$", code)
+            if t and t.group(1) in queries:
+                value, extra = t.group(2), 0
+                while value.count('"') % 2 and idx + extra + 1 < len(lines):
+                    extra += 1
+                    value += "\n" + lines[idx + extra]
+                if _built_text(value):
+                    out.append(Diagnostic(
+                        source.rel, k, t.start(1) + 1, "ПР-13", Severity.WARNING,
+                        f"Метод '{name}': текст запроса '{t.group(1)}' собирается из строк. "
+                        f"Писать запрос литералом Запрос{{ … }}, значения — параметрами.",
+                    ))
+    return out

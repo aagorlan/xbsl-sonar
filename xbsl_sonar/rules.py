@@ -629,6 +629,29 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-404",
         effort_minutes=5,
     ),
+    "ПР-19": RuleText(
+        code="ПР-19",
+        name="Сборка строки сложением в цикле",
+        description=(
+            "<p>Строка неизменяема: каждое сложение создаёт новую и копирует в неё всё "
+            "накопленное. В цикле из N витков это N копий растущей строки — время и память "
+            "растут квадратично, на длинном тексте сервер тратит секунды на склейку.</p>"
+            "<p><b>Находка:</b> в теле цикла <code>для</code> или <code>пока</code> к строковой "
+            "переменной прибавляют — <code>Итог += …</code> или <code>Итог = Итог + …</code>. "
+            "Строковая — объявлена в методе с типом <code>Строка</code> или строковым литералом "
+            "(<code>пер Итог = \"\"</code>), либо к ней прибавляют строковый литерал.</p>"
+            "<p><b>Не находка:</b> число (<code>Счёт += 1</code>); сложение вне цикла; части "
+            "в массиве и один <code>Строки.Соединить</code> после цикла.</p>"
+            "<p><b>Как исправить:</b> добавлять части в <code>Массив&lt;Строка&gt;</code> "
+            "и соединить один раз: <code>Строки.Соединить(Части, разделитель)</code>.</p>"
+            "<p>CWE-1046: Creation of Immutable Text Using String Concatenation "
+            "(ISO/IEC 5055, эффективность).</p>"
+        ),
+        type="CODE_SMELL",
+        severity="MINOR",
+        cwe="CWE-1046",
+        effort_minutes=10,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2536,5 +2559,64 @@ def query_result_not_disposed(source: SourceFile) -> Iterable[Diagnostic]:
                     source.rel, line + 1 + idx, m.start() + 2, "ПР-14", Severity.WARNING,
                     f"Метод '{name}': результат запроса проверяется на пустоту без исп и не "
                     f"закрывается. Закрепить его: исп Записи = Запрос{{ … }}.Выполнить(), затем Записи.Пусто().",
+                ))
+    return out
+
+
+# ПР-19: блоки в теле метода — открываются этими словами в начале строки, закрываются строкой `;`
+_BLOCK_OPEN = re.compile(r"^\s*(если|для|пока|попытка|выбор|область|if|for|while|try|case)\b")
+_LOOP_OPEN = re.compile(r"^\s*(для|пока|for|while)\b")
+_ELSE_IF = re.compile(r"^\s*(иначе\s+если|else\s+if)\b")
+_STRING_DECL = re.compile(r"^\s*(?:пер|var)\s+(\w+)\s*(?::\s*(\w+)\s*)?(?:=\s*(\S.*))?$")
+_SELF_ADD = re.compile(r"^\s*(\w+)\s*(?:\+=\s*(.*)|=\s*(\w+)\s*\+\s*(.*))$")
+
+
+@rule("ПР-19", "Сборка строки сложением в цикле", "D", severity=Severity.WARNING)
+def string_concatenation_in_loop(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, _ann, _header, lines in _methods_with_headers(source.text):
+        strings: set[str] = set()
+        others: set[str] = set()
+        blocks: list[tuple[bool, int]] = []  # (цикл, строка открытия)
+        for idx, raw in enumerate(lines):
+            text = _code_part(raw).rstrip()
+            if not text.strip():
+                continue
+            if text.strip() == ";":
+                if blocks:
+                    blocks.pop()
+                continue
+            decl = _STRING_DECL.match(text)
+            if decl:
+                var, typ, init = decl.group(1), decl.group(2), (decl.group(3) or "").strip()
+                if typ in ("Строка", "String") or (typ is None and init.startswith('"')):
+                    strings.add(var)
+                    others.discard(var)
+                else:
+                    others.add(var)
+                    strings.discard(var)
+                continue
+            if _BLOCK_OPEN.match(text) and not _ELSE_IF.match(text):
+                blocks.append((bool(_LOOP_OPEN.match(text)), line + 1 + idx))
+                continue
+            loop = next((n for is_loop, n in reversed(blocks) if is_loop), None)
+            if loop is None:
+                continue
+            add = _SELF_ADD.match(text)
+            if not add:
+                continue
+            var = add.group(1)
+            if add.group(3) is not None and add.group(3) != var:
+                continue
+            rhs = (add.group(2) if add.group(2) is not None else add.group(4)) or ""
+            literal = rhs.lstrip().startswith('"') or '+ "' in rhs
+            if var in strings or (literal and var not in others):
+                out.append(Diagnostic(
+                    source.rel, line + 1 + idx, raw.find(var) + 1, "ПР-19", Severity.WARNING,
+                    f"Метод '{name}': строка '{var}' собирается сложением в цикле (строка {loop}) — "
+                    f"каждый виток копирует всё накопленное. Собрать части в массив и соединить "
+                    f"один раз: Строки.Соединить(Части, разделитель).",
                 ))
     return out

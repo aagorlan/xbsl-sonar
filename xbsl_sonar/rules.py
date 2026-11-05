@@ -609,6 +609,26 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-89",
         effort_minutes=15,
     ),
+    "ПР-14": RuleText(
+        code="ПР-14",
+        name="Результат запроса не через исп",
+        description=(
+            "<p>Результат запроса — освобождаемый объект. Вызов метода прямо на "
+            "<code>Запрос{ … }.Выполнить()</code> результат не закрывает: платформа пишет в журнал "
+            "«Обнаружен незакрытый ресурс», а при нагрузке незакрытые результаты держат ресурсы "
+            "сервера.</p>"
+            "<p><b>Находка:</b> <code>….Выполнить().Пусто()</code> — проверка результата на пустоту "
+            "без <code>исп</code>.</p>"
+            "<p><b>Не находка:</b> <code>исп Записи = Запрос{ … }.Выполнить()</code> и затем "
+            "<code>Записи.Пусто()</code>.</p>"
+            "<p><b>Как исправить:</b> закрепить результат <code>исп</code> и проверять переменную.</p>"
+            "<p>CWE-404: Improper Resource Shutdown or Release (ISO/IEC 5055, надёжность).</p>"
+        ),
+        type="BUG",
+        severity="MINOR",
+        cwe="CWE-404",
+        effort_minutes=5,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2496,4 +2516,25 @@ def query_text_from_strings(source: SourceFile) -> Iterable[Diagnostic]:
                         f"Метод '{name}': текст запроса '{t.group(1)}' собирается из строк. "
                         f"Писать запрос литералом Запрос{{ … }}, значения — параметрами.",
                     ))
+    return out
+
+
+# ПР-14: результат запроса без `исп` — метод вызван прямо на результате `Выполнить()`.
+_RESULT_EMPTY = re.compile(r"\.Выполнить\(\)\s*\.Пусто\(\)")
+
+
+@rule("ПР-14", "Результат запроса не через исп", "D", severity=Severity.WARNING)
+def query_result_not_disposed(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, _ann, _header, lines in _methods_with_headers(source.text):
+        for idx, text_line in enumerate(lines):
+            m = _RESULT_EMPTY.search(_code_part(text_line))
+            if m:
+                out.append(Diagnostic(
+                    source.rel, line + 1 + idx, m.start() + 2, "ПР-14", Severity.WARNING,
+                    f"Метод '{name}': результат запроса проверяется на пустоту без исп и не "
+                    f"закрывается. Закрепить его: исп Записи = Запрос{{ … }}.Выполнить(), затем Записи.Пусто().",
+                ))
     return out

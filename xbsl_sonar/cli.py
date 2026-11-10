@@ -27,7 +27,7 @@ from xbsl_sonar import __version__, data, report
 from xbsl_sonar.rules import (ADMIN_ENV, DATA_ENV, IDENTITY_ENV, UPLOAD_ENV, INCIDENT_SINKS_ENV, MAX_ACCESSES_ENV,
                                UNBOUNDED_ENV, QUERIED_ENV,
                                MIN_PERIOD_ENV, PD_ENTITIES_ENV, PD_JOURNAL_ENV, PD_JOURNALED_ENV,
-                               RULE_IDS, SANITIZERS_ENV, SERVER_ENV, UNGUARDED_ENV)
+                               RULE_IDS, RULES, SANITIZERS_ENV, SERVER_ENV, UNGUARDED_ENV)
 
 _METHOD = re.compile(r"^\s*(?:статический\s+|static\s+)?(?:метод|method)\s+(\w+)", re.IGNORECASE)
 _CURRENT_USER = re.compile(r"\b(?:ТекущийПользователь|CurrentUser)\b")
@@ -580,20 +580,25 @@ def _check(args) -> int:
     if args.agreed:
         report.apply_agreed(findings, report.read_agreed(Path(args.agreed)))
     open_ = [f for f in findings if f.debt is None]
+    # Подсказка (уровень INFO в описании правила) видна в отчёте, но анализ не роняет
+    blocking = [f for f in open_ if RULES[f.rule].severity != "INFO"]
     for f in findings:
         mark = "" if f.debt is None else f" (исключение по {f.debt})"
+        if f.debt is None and RULES[f.rule].severity == "INFO":
+            mark = " (подсказка)"
         print(f"{f.path}:{f.line}:{f.col}: [{f.rule}]{mark} {f.message}")
     if "ПР-07" in rules and not args.pd_entities:
         print("ПР-07: сущности ПДн не заданы (--pd-entities) — чтение ПДн мимо журнала "
               "не проверялось, проверены только журнал событий и обращения")
     print(f"\nПравил: {len(rules)} ({', '.join(rules)}); находок: {len(findings)}, "
-          f"из них под исключением: {len(findings) - len(open_)}")
+          f"из них под исключением: {len(findings) - len(open_)}, "
+          f"подсказок: {len(open_) - len(blocking)}")
     if args.json:
         report.write_json({"version": __version__, "rules": rules,
                            "findings": [f.__dict__ for f in findings]}, Path(args.json))
     if args.bsl_report:
         report.write_json(report.bsl_report(findings, root), Path(args.bsl_report))
-    return 1 if open_ else 0
+    return 1 if blocking else 0
 
 
 def _data(args) -> int:

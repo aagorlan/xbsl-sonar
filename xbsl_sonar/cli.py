@@ -25,7 +25,7 @@ from pathlib import Path
 
 from xbsl_sonar import __version__, data, report
 from xbsl_sonar.rules import (ADMIN_ENV, DATA_ENV, IDENTITY_ENV, UPLOAD_ENV, INCIDENT_SINKS_ENV, MAX_ACCESSES_ENV,
-                               UNBOUNDED_ENV,
+                               UNBOUNDED_ENV, QUERIED_ENV,
                                MIN_PERIOD_ENV, PD_ENTITIES_ENV, PD_JOURNAL_ENV, PD_JOURNALED_ENV,
                                RULE_IDS, SANITIZERS_ENV, SERVER_ENV, UNGUARDED_ENV)
 
@@ -463,6 +463,45 @@ def pd_entities(paths: list[str], names: list[str]) -> str:
     return ",".join(f"{n}:{'|'.join(d)}" for n, d in dims.items())
 
 
+_WORD = re.compile(r"[^\W\d]\w*")
+_LIST_FIELD = re.compile(r"^\s*(?:-\s+)?(?:Поле|Выражение|Отбор|Таблица):\s*(.+?)\s*$")
+
+
+def _query_bodies(text: str) -> list[str]:
+    """Тексты литералов `Запрос{ … }` модуля — до парной закрывающей скобки."""
+    out = []
+    for m in _QUERY.finditer(text):
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        out.append(text[m.end():i - 1])
+    return out
+
+
+def queried_words(paths: list[str]) -> set[str]:
+    """Слова запросов проекта и отборов, сортировки и выражений динамических списков (для ПР-20).
+
+    Набор широкий: поле, имя которого встретилось хоть где-то в запросе, считается
+    используемым — ложная находка дороже пропуска.
+    """
+    words: set[str] = set()
+    for p in map(Path, paths):
+        files = sorted(p.rglob("*")) if p.is_dir() else [p]
+        for f in files:
+            if f.suffix == ".xbql":
+                words |= set(_WORD.findall(f.read_text(encoding="utf-8")))
+            elif f.suffix == ".xbsl":
+                for body in _query_bodies(f.read_text(encoding="utf-8")):
+                    words |= set(_WORD.findall(body))
+            elif f.suffix == ".yaml":
+                for line in f.read_text(encoding="utf-8").splitlines():
+                    m = _LIST_FIELD.match(line)
+                    if m:
+                        words |= set(_WORD.findall(m.group(1)))
+    return words
+
+
 def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                 sanitizers: str = "", min_period: str = "",
                 server_file: Path | None = None, data_file: Path | None = None,
@@ -470,7 +509,8 @@ def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                 pd: dict[str, str] | None = None,
                 admin_file: Path | None = None,
                 upload_file: Path | None = None,
-                unbounded_file: Path | None = None) -> list[report.Finding]:
+                unbounded_file: Path | None = None,
+                queried_file: Path | None = None) -> list[report.Finding]:
     cmd = [sys.executable, "-m", "xbsl", "--data-dir", str(data_dir), "--lang", "ru",
            "--select", ",".join(rules), "--format", "json", *paths]
     env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths))),
@@ -481,6 +521,7 @@ def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                               ADMIN_ENV: str(admin_file or ""),
                               UPLOAD_ENV: str(upload_file or ""),
                               UNBOUNDED_ENV: str(unbounded_file or ""),
+                              QUERIED_ENV: str(queried_file or ""),
                               MIN_PERIOD_ENV: min_period,
                               MAX_ACCESSES_ENV: max_accesses, **(pd or {})})
     done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
@@ -519,6 +560,8 @@ def _check(args) -> int:
         unbounded_file = Path(tmp) / "unbounded.txt"
         unbounded_file.write_text("\n".join(f"{k}\t{v}" for k, v in sorted(unbounded_methods(args.paths).items())),
                                   encoding="utf-8")
+        queried_file = Path(tmp) / "queried.txt"
+        queried_file.write_text("\n".join(sorted(queried_words(args.paths))), encoding="utf-8")
         pd_names = list(filter(None, (args.pd_entities or "").split(",")))
         journal = list(filter(None, (args.pd_journal or "").split(",")))
         journaled_file = Path(tmp) / "journaled.txt"
@@ -530,7 +573,7 @@ def _check(args) -> int:
         findings = _run_engine(args.paths, data_dir, rules, args.sanitizers or "",
                                args.min_period or "", server_file, data_file,
                                args.max_accesses or "", unguarded_file, pd, admin_file,
-                               upload_file, unbounded_file)
+                               upload_file, unbounded_file, queried_file)
     report.apply_exceptions(findings, root)
     if args.perimeter:
         report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))

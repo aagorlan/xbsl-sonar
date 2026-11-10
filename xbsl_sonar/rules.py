@@ -652,6 +652,31 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-1046",
         effort_minutes=10,
     ),
+    "ПР-20": RuleText(
+        code="ПР-20",
+        name="Лишний индекс",
+        description=(
+            "<p>Каждый индекс база обновляет при каждой записи и хранит рядом с таблицей. "
+            "Индекс, который повторяет уже существующий или по которому никто не ищет, только "
+            "замедляет запись и занимает место.</p>"
+            "<p><b>Находка:</b> индекс из раздела <code>Индексы</code> YAML (а) повторяет другой "
+            "индекс того же элемента или его начало; (б) повторяет начало индекса, который "
+            "платформа строит сама, — у регистра сведений без периодичности по измерениям "
+            "в порядке их описания, у справочника по <code>Ссылка</code> и по "
+            "<code>Наименование</code> + <code>Ссылка</code>; (в) начинается с поля, которого нет "
+            "ни в одном запросе проекта и ни в отборе или сортировке динамического списка.</p>"
+            "<p><b>Не находка:</b> индекс по полю, которым отбирают, соединяют или сортируют "
+            "в запросах; индекс, которого нет среди других как начала; дополнительные поля "
+            "индекса.</p>"
+            "<p><b>Как исправить:</b> удалить индекс; если по полю всё же ищут — описать, где.</p>"
+            "<p>CWE-1089: Large Data Table with Excessive Number of Indices "
+            "(ISO/IEC 5055, эффективность).</p>"
+        ),
+        type="CODE_SMELL",
+        severity="MINOR",
+        cwe="CWE-1089",
+        effort_minutes=5,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -702,6 +727,10 @@ UNBOUNDED_ENV = "XBSL_SONAR_UNBOUNDED"
 # Порог обращений к серверу и базе в обработчике формы для ПР-17 — параметр `--max-accesses`.
 MAX_ACCESSES_ENV = "XBSL_SONAR_MAX_ACCESSES"
 DEFAULT_MAX_ACCESSES = 3
+# Слова, которые встречаются в запросах проекта и в отборах и сортировке динамических списков
+# (для ПР-20), — по строке; набор собирает `check` (`queried_words`) и кладёт файлом.
+# Здесь — путь к этому файлу. Пусто — набора нет, вторая половина ПР-20 не проверяется.
+QUERIED_ENV = "XBSL_SONAR_QUERIED"
 # Функции очистки разметки для ПР-04 — параметр `--sanitizers` команды `check`.
 SANITIZERS_ENV = "XBSL_SONAR_SANITIZERS"
 DEFAULT_SANITIZERS = ("очистить",)
@@ -2619,4 +2648,110 @@ def string_concatenation_in_loop(source: SourceFile) -> Iterable[Diagnostic]:
                     f"каждый виток копирует всё накопленное. Собрать части в массив и соединить "
                     f"один раз: Строки.Соединить(Части, разделитель).",
                 ))
+    return out
+
+
+# ПР-20: лишние индексы в YAML. Разбор — по строкам и отступам: раздел верхнего уровня
+# открывается ключом с нулевым отступом, элементы списка — строкой «-» с отступом 4
+_TOP_KEY = re.compile(r"^([^\s#][^:]*):\s*(.*?)\s*$")
+_LIST_ITEM = re.compile(r"^\s+-\s*(\S.*?)?\s*$")
+_ITEM_KEY = re.compile(r"^(\s+)(?:-\s+)?([^\s:#][^:#]*?):\s*(.*?)\s*$")
+
+
+def _sections(lines: list[str]) -> dict[str, tuple[str, list[tuple[int, str]]]]:
+    """Разделы верхнего уровня: имя → (значение в строке ключа, строки раздела с номерами)."""
+    out: dict[str, tuple[str, list[tuple[int, str]]]] = {}
+    current: str | None = None
+    for n, line in enumerate(lines, 1):
+        m = _TOP_KEY.match(line)
+        if m:
+            current = m.group(1)
+            out[current] = (m.group(2), [])
+        elif current is not None:
+            out[current][1].append((n, line))
+    return out
+
+
+def _items(block: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
+    """Элементы списка раздела: строки от «-» с отступом 4 до следующего такого же."""
+    items: list[list[tuple[int, str]]] = []
+    for n, line in block:
+        if re.match(r"^ {4}-\s*$", line) or re.match(r"^ {4}-\s+\S", line):
+            items.append([])
+        if items:
+            items[-1].append((n, line))
+    return items
+
+
+def _index(item: list[tuple[int, str]]) -> tuple[str, int, list[str]]:
+    """Индекс: имя, строка имени и основные поля по порядку (без дополнительных)."""
+    name, at, fields, in_fields, fields_indent = "", item[0][0], [], False, -1
+    for n, line in item:
+        k = _ITEM_KEY.match(line)
+        if k and (in_fields is False or len(k.group(1)) <= fields_indent):
+            in_fields = k.group(2) == "Поля"
+            fields_indent = len(k.group(1))
+            if k.group(2) == "Имя":
+                name, at = k.group(3), n
+            continue
+        li = _LIST_ITEM.match(line)
+        if in_fields and li and li.group(1):
+            fields.append(li.group(1))
+    return name, at, fields
+
+
+def _dimensions(block: list[tuple[int, str]]) -> list[str]:
+    out = []
+    for item in _items(block):
+        for _n, line in item:
+            k = _ITEM_KEY.match(line)
+            if k and k.group(2) == "Имя" and len(k.group(1)) == 8:
+                out.append(k.group(3))
+                break
+    return out
+
+
+def _queried() -> frozenset[str] | None:
+    path = os.environ.get(QUERIED_ENV, "")
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return frozenset(filter(None, f.read().split("\n")))
+
+
+@rule("ПР-20", "Лишний индекс", "D", severity=Severity.WARNING)
+def excessive_index(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "yaml":
+        return []
+    sections = _sections(source.text.splitlines())
+    if "Индексы" not in sections:
+        return []
+    kind = sections.get("ВидЭлемента", ("", []))[0]
+    own: list[tuple[str, list[str]]] = []
+    if kind == "РегистрСведений" and sections.get("Периодичность", ("", []))[0] in ("", "Непериодический"):
+        own.append(("индекс платформы по измерениям", _dimensions(sections.get("Измерения", ("", []))[1])))
+    if kind == "Справочник":
+        own += [("индекс платформы по ссылке", ["Ссылка"]),
+                ("индекс платформы по наименованию", ["Наименование", "Ссылка"])]
+    indexes = [_index(item) for item in _items(sections["Индексы"][1])]
+    queried = _queried()
+    out: list[Diagnostic] = []
+    for i, (name, at, fields) in enumerate(indexes):
+        if not fields:
+            continue
+        others = own + [(f"индекс «{o[0]}»", o[2]) for j, o in enumerate(indexes) if j != i
+                        and (o[2] != fields or j < i)]
+        cover = next((what for what, of in others if len(of) >= len(fields) and of[:len(fields)] == fields), None)
+        if cover:
+            out.append(Diagnostic(
+                source.rel, at, 1, "ПР-20", Severity.WARNING,
+                f"Индекс «{name}» ({', '.join(fields)}) повторяет начало, которое уже даёт {cover}. "
+                f"Удалить его: база обновляет каждый индекс при каждой записи.",
+            ))
+        elif queried is not None and fields[0] not in queried:
+            out.append(Diagnostic(
+                source.rel, at, 1, "ПР-20", Severity.WARNING,
+                f"Индекс «{name}» начинается с поля «{fields[0]}», которого нет ни в одном запросе "
+                f"проекта и ни в отборе или сортировке списка. Удалить индекс или описать, где по полю ищут.",
+            ))
     return out

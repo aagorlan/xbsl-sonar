@@ -677,6 +677,33 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-1089",
         effort_minutes=5,
     ),
+    "ПР-21": RuleText(
+        code="ПР-21",
+        name="Обращение к данным из модуля формы",
+        description=(
+            "<p>Форма отвечает за показ и ввод, а чтение и запись данных — дело модуля менеджера "
+            "или общего модуля. Запрос, разбросанный по формам, не найти, когда меняется "
+            "модель данных, его нельзя переиспользовать в другой форме, в задании или "
+            "HTTP-сервисе, а права и производительность приходится проверять в каждой форме "
+            "заново.</p>"
+            "<p><b>Находка:</b> в модуле компонента интерфейса (пара <code>.yaml</code> — "
+            "<code>ВидЭлемента: КомпонентИнтерфейса</code>) — литерал запроса "
+            "<code>Запрос{…}</code>, чтение записи или объекта "
+            "(<code>ЗагрузитьЗапись</code>, <code>ЗагрузитьОбъект</code>, "
+            "<code>ПолучитьОбъект</code>) или набор записей (<code>НаборЗаписей</code>).</p>"
+            "<p><b>Не находка:</b> форма зовёт метод модуля менеджера или общего модуля; "
+            "те же обращения в модуле менеджера, объекта или в общем модуле.</p>"
+            "<p><b>Как исправить:</b> вынести обращение в метод модуля менеджера сущности "
+            "(или общего модуля) и звать его из формы.</p>"
+            "<p>Уровень — подсказка: находка видна в отчёте, но анализ не роняет.</p>"
+            "<p>CWE-1057: Data Access Operations Outside of Expected Data Manager Component "
+            "(ISO/IEC 5055, сопровождаемость).</p>"
+        ),
+        type="CODE_SMELL",
+        severity="INFO",
+        cwe="CWE-1057",
+        effort_minutes=15,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2753,5 +2780,33 @@ def excessive_index(source: SourceFile) -> Iterable[Diagnostic]:
                 source.rel, at, 1, "ПР-20", Severity.WARNING,
                 f"Индекс «{name}» начинается с поля «{fields[0]}», которого нет ни в одном запросе "
                 f"проекта и ни в отборе или сортировке списка. Удалить индекс или описать, где по полю ищут.",
+            ))
+    return out
+
+
+# ПР-21: обращение к данным в модуле формы — литерал запроса, чтение записи или объекта,
+# набор записей. Модуль формы — `.xbsl`, пара которого `ВидЭлемента: КомпонентИнтерфейса`
+_FORM_DATA_ACCESS = re.compile(
+    r"(?<![\w.])(?:Запрос|Query)\s*\{"
+    r"|\.\s*(?:ЗагрузитьЗапись|ЗагрузитьОбъект|ПолучитьОбъект|LoadRecord|LoadObject|GetObject)\s*\("
+    r"|\b(?:НаборЗаписей|RecordSet)\b"
+)
+
+
+@rule("ПР-21", "Обращение к данным из модуля формы", "D", severity=Severity.INFO)
+def data_access_in_form(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl" or not _pair_component(source):
+        return []
+    out: list[Diagnostic] = []
+    for name, line, _ann, _header, lines in _methods_with_headers(source.text):
+        for idx, raw in enumerate(lines):
+            m = _FORM_DATA_ACCESS.search(_strip_literals(_code_part(raw)))
+            if not m:
+                continue
+            what = m.group(0).rstrip("({ ").lstrip(". ")
+            out.append(Diagnostic(
+                source.rel, line + 1 + idx, m.start() + 1, "ПР-21", Severity.INFO,
+                f"Метод '{name}': обращение к данным ({what}) в модуле формы. Вынести его в метод "
+                f"модуля менеджера или общего модуля и звать оттуда.",
             ))
     return out

@@ -704,6 +704,36 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-1057",
         effort_minutes=15,
     ),
+    "ПР-22": RuleText(
+        code="ПР-22",
+        name="HTTP-сервис открыт всем, а обработчик не проверяет допуск",
+        description=(
+            "<p>Шаблон HTTP-сервиса с правом <code>Вызов: РазрешеноВсем</code> платформа "
+            "отдаёт любому, кто знает адрес: ни входа, ни прав. Если обработчик не сверяет "
+            "секрет, ключ или подпись запроса сам, он выполняет чужой запрос — чаще всего "
+            "с повышенными правами, потому что у анонимного вызова своих нет.</p>"
+            "<p><b>Находка:</b> в модуле HTTP-сервиса (пара <code>.yaml</code> — "
+            "<code>ВидЭлемента: HttpСервис</code>) обработчик метода шаблона "
+            "(<code>ЛюбойМетод</code> или <code>Методы → Обработчик</code>), для которого "
+            "действует <code>Вызов: РазрешеноВсем</code> — у метода, у шаблона или у сервиса, "
+            "что задано ближе, — и ни в самом обработчике, ни в методах того же модуля, "
+            "которые он вызывает, нет одновременно чтения заголовка запроса "
+            "(<code>Заголовки</code>) и ответа <code>401</code> или <code>403</code>.</p>"
+            "<p><b>Не находка:</b> обработчик или вызванный им метод модуля читает заголовок "
+            "запроса и отвечает 401/403; обработчик не трогает данных — ни запроса, ни повышения "
+            "прав, ни чтения и записи объектов, ни вызова других модулей (отдаёт ресурс); шаблон "
+            "или метод с правом <code>РазрешеноАутентифицированным</code> и уже.</p>"
+            "<p><b>Как исправить:</b> сверить секрет из заголовка с настройкой до любой работы "
+            "и отказать кодом 401; открытый без допуска намеренно — пометить "
+            "<code>// анализ:исключение ПР-22 ТД-N — причина</code> над обработчиком.</p>"
+            "<p>CWE-306: Missing Authentication for Critical Function "
+            "(OWASP A07:2021 Identification and Authentication Failures).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="CRITICAL",
+        cwe="CWE-306",
+        effort_minutes=30,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2809,4 +2839,149 @@ def data_access_in_form(source: SourceFile) -> Iterable[Diagnostic]:
                 f"Метод '{name}': обращение к данным ({what}) в модуле формы. Вынести его в метод "
                 f"модуля менеджера или общего модуля и звать оттуда.",
             ))
+    return out
+
+
+# ПР-22: HTTP-сервис, открытый всем, без проверки допуска в обработчике. Право — ближайшее
+# из метода шаблона, шаблона и сервиса; допуск — чтение заголовка и ответ 401/403 в обработчике
+# или в методах модуля, до которых он доходит. Находка — на строке обработчика в модуле:
+# там её видно, и там ставится пометка исключения.
+_HTTP_KIND = re.compile(r"^ВидЭлемента:\s*HttpСервис\s*$", re.MULTILINE)
+_OPEN_TO_ALL = {"РазрешеноВсем", "AllowedToAll"}
+# Чтение заголовка запроса — не установка заголовка ответа (`Ответ.Заголовки.Добавить`)
+_HEADERS = re.compile(r"\b(?:Заголовки|Headers)\s*\.\s*(?:Получить\w*|Содержит\w*|Get\w*|Contains\w*)\s*\(")
+# Работа с данными: запрос, повышение прав, чтение и запись объектов и записей
+_TOUCHES_DATA = re.compile(
+    r"(?<![\w.])(?:Запрос|Query)\s*\{"
+    r"|\b(?:Привилегированный|Privileged|ЗагрузитьОбъект|ЗагрузитьЗапись|ПолучитьОбъект|НаборЗаписей"
+    r"|LoadObject|LoadRecord|GetObject|RecordSet)\b"
+    r"|\.\s*(?:Записать|Удалить|Write|Delete)\s*\("
+)
+_CHAIN_HEAD = re.compile(r"(?<![\w.])([А-ЯЁA-Z]\w*)\s*\.\s*\w+(?:\s*\.\s*\w+)*\s*\(")
+_LOCAL = re.compile(r"\b(?:знч|пер|val|var)\s+(\w+)|\bдля\s+(\w+)\s+из\b|^\s*метод\s+\w+\s*\(([^)]*)\)",
+                    re.MULTILINE)
+_PLAIN_TYPES = {"СериализацияJson", "Кодировки", "JsonSerialization", "Encodings"}
+_DENIED = re.compile(r"(?<![\w.])40[13](?![\w.])")
+
+
+def _http_handlers(yaml_text: str) -> list[tuple[str, str]]:
+    """Обработчики методов шаблонов и действующее для них право: (обработчик, право).
+    Право — ближайшее заданное: у метода шаблона, у шаблона, у сервиса."""
+    section = ""          # ключ верхнего уровня
+    service = ""
+    templates: list[dict] = []
+    template: dict | None = None
+    method: dict | None = None
+    template_key = ""     # ключ шаблона, внутри которого строка (Методы, КонтрольДоступа…)
+    method_key = ""       # ключ метода шаблона, внутри которого строка
+    for raw in yaml_text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        col = len(raw) - len(raw.lstrip(" "))
+        body = raw.strip()
+        dash = body.startswith("-")
+        if dash:
+            body = body[1:].strip()
+            if section == "ШаблоныUrl" and col <= 4:
+                template = {"right": "", "methods": []}
+                templates.append(template)
+                method, template_key = None, ""
+            elif template is not None and template_key == "Методы" and col > 8:
+                method = {"handler": "", "right": ""}
+                template["methods"].append(method)
+                method_key = ""
+            if not body:
+                continue
+            col = raw.index(body[0], col + 1)
+        m = re.match(r"^([^\s:#][^:#]*?):\s*(.*?)\s*$", body)
+        if not m:
+            continue
+        key, value = m.group(1), m.group(2)
+        if col == 0:
+            section, template, method = key, None, None
+            continue
+        if section == "КонтрольДоступа" and key in ("Вызов", "Call"):
+            service = value
+        if template is None:
+            continue
+        if col <= 8:
+            template_key, method = key, None
+            if key in ("ЛюбойМетод", "AnyMethod") and value:
+                template["methods"].append({"handler": value, "right": ""})
+            continue
+        if template_key == "КонтрольДоступа" and key in ("Вызов", "Call"):
+            template["right"] = value
+        elif template_key == "Методы" and method is not None:
+            if col <= 16 and key in ("Обработчик", "Handler"):
+                method["handler"] = value
+            elif col <= 16:
+                method_key = key
+            elif method_key == "КонтрольДоступа" and key in ("Вызов", "Call"):
+                method["right"] = value
+    out: list[tuple[str, str]] = []
+    for t in templates:
+        for mth in t["methods"]:
+            if mth["handler"]:
+                out.append((mth["handler"], mth["right"] or t["right"] or service))
+    return out
+
+
+def _closure(name: str, bodies: dict[str, str], seen: set[str]) -> list[str]:
+    """Тело обработчика и методов модуля, до которых он доходит, — без литералов и комментариев."""
+    if name in seen or name not in bodies:
+        return []
+    seen.add(name)
+    body = "\n".join(_strip_literals(_code_part(line)) for line in bodies[name].splitlines())
+    out = [body]
+    for module, called in _TEXT_CALL.findall(body):
+        if not module and called in bodies:
+            out += _closure(called, bodies, seen)
+    return out
+
+
+def _touches_data(header: str, parts: list[str]) -> bool:
+    """Обработчик работает с данными: запрос, повышение прав, объекты — или зовёт другой модуль,
+    за которым их не видно. Свои переменные, параметры и сериализация — не другой модуль."""
+    text = header + "\n" + "\n".join(parts)
+    if _TOUCHES_DATA.search(text):
+        return True
+    own = set(_PLAIN_TYPES)
+    for m in _LOCAL.finditer(text):
+        if m.group(1) or m.group(2):
+            own.add(m.group(1) or m.group(2))
+        elif m.group(3):
+            own |= set(re.findall(r"(\w+)\s*:", m.group(3)))
+    return any(head not in own for head in _CHAIN_HEAD.findall(text))
+
+
+@rule("ПР-22", "HTTP-сервис открыт всем, а обработчик не проверяет допуск", "S",
+      severity=Severity.WARNING)
+def open_http_handler(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    yaml_text = _read_pair(source.path, ".yaml")
+    if not yaml_text or not _HTTP_KIND.search(yaml_text):
+        return []
+    bodies = _text_bodies(source.text)
+    methods = {name: (line, header) for name, line, _a, header, _b in _methods_with_headers(source.text)}
+    out: list[Diagnostic] = []
+    reported: set[str] = set()
+    for handler, right in _http_handlers(yaml_text):
+        if right not in _OPEN_TO_ALL or handler in reported or handler not in bodies:
+            continue
+        parts = _closure(handler, bodies, set())
+        text = "\n".join(parts)
+        headers, denied = bool(_HEADERS.search(text)), bool(_DENIED.search(text))
+        if headers and denied:
+            continue
+        if not _touches_data(methods.get(handler, (1, ""))[1], parts):
+            continue
+        reported.add(handler)
+        missing = "ни чтения заголовка, ни отказа 401/403" if not (headers or denied) else (
+            "нет отказа 401/403" if headers else "нет чтения заголовка")
+        out.append(Diagnostic(
+            source.rel, methods.get(handler, (1, ""))[0], 1, "ПР-22", Severity.WARNING,
+            f"Обработчик '{handler}' открыт всем (Вызов: {right}), а проверки допуска нет: "
+            f"{missing}. Сверить секрет из заголовка с настройкой и отказать 401 до любой работы.",
+        ))
     return out

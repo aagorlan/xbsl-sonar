@@ -734,6 +734,36 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-306",
         effort_minutes=30,
     ),
+    "ПР-23": RuleText(
+        code="ПР-23",
+        name="Секрет уходит на клиент",
+        description=(
+            "<p>Метод с аннотацией <code>@ДоступноСКлиента</code> вызывается из браузера, и всё, "
+            "что он возвращает, видно в инструментах разработчика. Токен, пароль или ключ, "
+            "отданный таким методом открытой строкой, перестаёт быть секретом — даже если форма, "
+            "которая его зовёт, доступна только администратору.</p>"
+            "<p><b>Находка:</b> метод <code>@ДоступноСКлиента</code> возвращает значение, прочитанное "
+            "из источника секрета, — вызов, поле или свойство, чьё имя говорит о секрете "
+            "(<code>Токен…</code>, <code>Пароль…</code>, <code>Секрет…</code>, <code>КлючAPI…</code>), "
+            "или переменную, которой такое значение присвоено: возвращаемый тип — <code>Строка</code>; "
+            "либо в конструкторе структуры внутри метода поле с таким именем получает значение "
+            "из источника секрета.</p>"
+            "<p><b>Не находка:</b> ветви условного выражения — литералы "
+            "(<code>Токен.Пусто() ? \"\" : \"задан\"</code>); результат <code>Булево</code> "
+            "(«задан ли»); значение типа <code>СекретПриложения</code> — серверный секрет на клиенте "
+            "не раскрывается; переменная с «секретным» именем, в которую секрет не попадал; "
+            "метод без <code>@ДоступноСКлиента</code>.</p>"
+            "<p><b>Как исправить:</b> отдавать на клиент признак («задан» / пусто), а сам секрет "
+            "читать и применять только на сервере; новый секрет принимать с клиента, но не "
+            "возвращать.</p>"
+            "<p>CWE-522: Insufficiently Protected Credentials; CWE-200: Exposure of Sensitive "
+            "Information to an Unauthorized Actor (OWASP A02:2021 Cryptographic Failures).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="CRITICAL",
+        cwe="CWE-522",
+        effort_minutes=15,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -2984,4 +3014,172 @@ def open_http_handler(source: SourceFile) -> Iterable[Diagnostic]:
             f"Обработчик '{handler}' открыт всем (Вызов: {right}), а проверки допуска нет: "
             f"{missing}. Сверить секрет из заголовка с настройкой и отказать 401 до любой работы.",
         ))
+    return out
+
+
+# ПР-23: секрет уходит на клиент. Источник секрета — вызов, поле или свойство с «секретным»
+# именем (как у ПР-06); своя переменная или параметр — источник, только если ей присвоили
+# источник. Условное выражение смотрится по ветвям: литералы в обеих — признак, не секрет.
+# Находка — на строке `возврат` или поля конструктора.
+_NOT_SECRET_VALUE = re.compile(r"Задан|Пуст|Есть|Длина|Провер|Установ|Записа|Измен|Сброс"
+                               r"|Given|Empty|Has|Length|Check|Set|Write", re.IGNORECASE)
+_IDENT = re.compile(r"(?<![\w])(\.?)\s*([^\W\d]\w*)")
+_DECLARED = re.compile(r"^\s*(?:знч|пер|val|var)\s+(\w+)(?:\s*:\s*[^=]+)?\s*=\s*(.+)$", re.DOTALL)
+_ASSIGNED = re.compile(r"^\s*(\w+)\s*=\s*(?!=)(.+)$", re.DOTALL)
+_RETURN = re.compile(r"^\s*(?:возврат|return)\b(.*)$", re.DOTALL)
+_RETURN_TYPE = re.compile(r"\)\s*:\s*([\w.<>?, ]+?)\s*$")
+_STRING_TYPES = {"Строка", "Строка?", "String", "String?"}
+_NEW = re.compile(r"(?<![\w])(?:новый|new)\s+[\w.]+\s*\(")
+_CONTINUES = re.compile(r"(?:[=+\-*/?:,(.]|\b(?:и|или|и\s+не|and|or))\s*$")
+_CONTINUED = re.compile(r"^\s*(?:[?:+\-*/.)]|\b(?:и|или|and|or)\b)")
+
+
+def _statements(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Операторы тела: строки склеиваются, пока открыты скобки или строка явно продолжается."""
+    out: list[tuple[int, str]] = []
+    current: list[str] = []
+    start = 0
+    depth = 0
+    for k, (n, line) in enumerate(lines):
+        code = _strip_literals(_code_part(line)).rstrip()
+        if not code.strip() and not current:
+            continue
+        if not current:
+            start = n
+        current.append(code)
+        depth += code.count("(") - code.count(")")
+        nxt = lines[k + 1][1] if k + 1 < len(lines) else ""
+        if depth > 0 or _CONTINUES.search(code) or _CONTINUED.match(_code_part(nxt)):
+            continue
+        out.append((start, " ".join(c.strip() for c in current)))
+        current, depth = [], 0
+    if current:
+        out.append((start, " ".join(c.strip() for c in current)))
+    return out
+
+
+def _top_split(expr: str, sep: str) -> list[str]:
+    parts, depth, last = [], 0, 0
+    for i, c in enumerate(expr):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == sep and depth == 0:
+            parts.append(expr[last:i])
+            last = i + 1
+    parts.append(expr[last:])
+    return parts
+
+
+def _branches(expr: str) -> list[str]:
+    """Значения выражения: у условного `у ? а : б` — ветви а и б (рекурсивно), иначе само."""
+    depth = 0
+    for i, c in enumerate(expr):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "?" and depth == 0 and expr[i + 1:i + 2] not in ("?", ".") \
+                and expr[i - 1:i] not in ("?",):
+            rest = expr[i + 1:]
+            d = 0
+            for j, ch in enumerate(rest):
+                if ch in "([{":
+                    d += 1
+                elif ch in ")]}":
+                    d -= 1
+                elif ch == ":" and d == 0:
+                    return _branches(rest[:j]) + _branches(rest[j + 1:])
+            return [expr]
+    return [expr]
+
+
+def _secret_source(expr: str, own: set[str], tainted: set[str]) -> str | None:
+    """Имя источника секрета в значении выражения или None."""
+    for branch in _branches(expr):
+        # Значение — СекретПриложения: серверный секрет на клиенте не раскрывается
+        if _APP_SECRET.search(branch):
+            continue
+        for m in _IDENT.finditer(branch):
+            dotted, name = m.group(1), m.group(2)
+            follow = branch[m.end():].lstrip()
+            if not dotted and name in own:
+                if name in tainted and not follow.startswith("."):
+                    return name
+                continue
+            if not _SECRET_NAME.search(name) or _NOT_SECRET_VALUE.search(name):
+                continue
+            # `Токен.Пусто()`, `Пароль.Длина()` — признак, а не значение
+            nxt = re.match(r"\.\s*(\w+)", follow)
+            if nxt and _NOT_SECRET_VALUE.search(nxt.group(1)):
+                continue
+            return name
+    return None
+
+
+def _constructor_fields(expr: str) -> list[tuple[str, str]]:
+    """Именованные аргументы конструкторов `новый Т(Поле = значение, …)` в выражении."""
+    out: list[tuple[str, str]] = []
+    for m in _NEW.finditer(expr):
+        depth, i = 1, m.end()
+        while i < len(expr) and depth:
+            depth += {"(": 1, ")": -1}.get(expr[i], 0)
+            i += 1
+        for arg in _top_split(expr[m.end():i - 1], ","):
+            named = re.match(r"^\s*(\w+)\s*=\s*(?!=)(.+)$", arg, re.DOTALL)
+            if named:
+                out.append((named.group(1), named.group(2)))
+    return out
+
+
+@rule("ПР-23", "Секрет уходит на клиент", "S", severity=Severity.WARNING)
+def secret_to_client(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, annotations, header, body in _methods_with_headers(source.text):
+        if not annotations & _FROM_CLIENT:
+            continue
+        rtype = _RETURN_TYPE.search(header.replace("\n", " "))
+        returns = rtype.group(1).strip() if rtype else ""
+        params = re.search(r"\((.*)\)", header.replace("\n", " "), re.DOTALL)
+        own = set(re.findall(r"(\w+)\s*:", params.group(1))) if params else set()
+        tainted: set[str] = set()
+        reported: set[int] = set()
+        first = line + header.count("\n") + 1
+        statements = _statements([(first + k, text) for k, text in enumerate(body)])
+        for n, stmt in statements:
+            m = _DECLARED.match(stmt)
+            if m:
+                own.add(m.group(1))
+            for field, value in _constructor_fields(stmt):
+                if not _SECRET_NAME.search(field) or n in reported:
+                    continue
+                if _APP_SECRET.search(returns) or _secret_source(value, own, tainted) is None:
+                    continue
+                reported.add(n)
+                out.append(Diagnostic(
+                    source.rel, n, 1, "ПР-23", Severity.WARNING,
+                    f"Метод '{name}' доступен с клиента, а поле {field} структуры получает секрет "
+                    f"({_secret_source(value, own, tainted)}) — он уйдёт в браузер. Отдавать признак "
+                    f"«задан», секрет держать на сервере.",
+                ))
+            target = m or _ASSIGNED.match(stmt)
+            if target and target.group(1) in own:
+                if _secret_source(target.group(2), own, tainted):
+                    tainted.add(target.group(1))
+                else:
+                    tainted.discard(target.group(1))
+            r = _RETURN.match(stmt)
+            if not r or returns not in _STRING_TYPES or n in reported:
+                continue
+            found = _secret_source(r.group(1), own, tainted)
+            if found:
+                reported.add(n)
+                out.append(Diagnostic(
+                    source.rel, n, 1, "ПР-23", Severity.WARNING,
+                    f"Метод '{name}' доступен с клиента и возвращает секрет строкой ({found}) — "
+                    f"он уйдёт в браузер. Отдавать признак «задан», секрет держать на сервере.",
+                ))
     return out

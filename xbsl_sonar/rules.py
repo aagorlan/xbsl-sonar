@@ -764,6 +764,35 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-522",
         effort_minutes=15,
     ),
+    "ПР-24": RuleText(
+        code="ПР-24",
+        name="Открытый переход",
+        description=(
+            "<p>Ссылка вида <code>…/app?next=https://чужой.сайт</code> выглядит как адрес приложения, "
+            "а уводит пользователя туда, куда скажет автор ссылки: на поддельную страницу входа "
+            "или за данными. Переход выполняет само приложение — пользователь ему доверяет.</p>"
+            "<p><b>Находка:</b> <code>ПерейтиПоСсылке(…)</code> или "
+            "<code>Аутентификация.ЗавершитьТекущийСеанс(…)</code>, адрес которого получен извне: "
+            "параметр обработчика <code>ПриОткрытииПоСсылке</code> или параметр типа "
+            "<code>ПараметрыUrl</code>, <code>Параметры.Получить…(…)</code>, значение поля формы "
+            "(<code>Компоненты.Имя.Значение</code>), результат скрипта контейнера HTML "
+            "(<code>ВызватьМетод</code>), тело HTTP-запроса или ответа, параметр-запрос "
+            "HTTP-сервиса — напрямую или через переменную метода.</p>"
+            "<p><b>Не находка:</b> литерал; литерал с постоянным хостом в начале "
+            "(<code>\"https://t.me/share/url?…\" + Текст</code>); <code>НавигационнаяСсылка</code>; "
+            "параметр системы или метод, который адрес возвращает; хранимый реквизит — ссылка, "
+            "по которой пользователь уходит сам; объявление своего метода с таким именем.</p>"
+            "<p><b>Как исправить:</b> брать адрес перехода из настройки или "
+            "<code>НавигационнаяСсылка</code>; пришедший извне — сверять с перечнем разрешённых "
+            "адресов или принимать только относительный путь своего приложения.</p>"
+            "<p>CWE-601: URL Redirection to Untrusted Site ('Open Redirect') "
+            "(OWASP A01:2021 Broken Access Control).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MAJOR",
+        cwe="CWE-601",
+        effort_minutes=15,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -3182,4 +3211,76 @@ def secret_to_client(source: SourceFile) -> Iterable[Diagnostic]:
                     f"Метод '{name}' доступен с клиента и возвращает секрет строкой ({found}) — "
                     f"он уйдёт в браузер. Отдавать признак «задан», секрет держать на сервере.",
                 ))
+    return out
+
+
+# ПР-24: открытый переход. Адрес перехода (ПерейтиПоСсылке, ЗавершитьТекущийСеанс) пришёл извне:
+# из параметров адреса страницы, поля формы, скрипта контейнера HTML, тела HTTP-запроса или ответа.
+# Адрес из литерала, НавигационнаяСсылка, параметра системы или метода, который их возвращает, —
+# не находка: источником он не считается. Хранимые реквизиты — тоже не находка: ссылка в профиле,
+# по которой участник уходит сам, — функция, а не перенаправление чужой ссылкой.
+_REDIRECT_CALL = re.compile(r"(?:(?<![\w.])ПерейтиПоСсылке|(?<![\w])ЗавершитьТекущийСеанс)\s*\(")
+_REDIRECT_DECL = re.compile(r"^\s*(?:статический\s+)?метод\s")
+_URL_PARAMS = re.compile(r"(\w+)\s*:\s*ПараметрыUrl\??\s*[,)]")
+_REDIRECT_SOURCES = (
+    (re.compile(r"\.ВызватьМетод\s*\("), "результат скрипта контейнера HTML"),
+    (re.compile(r"(?<![\w])Компоненты\.\w+\.(?:Значение|ТекстРедактирования)(?![\w])"), "значение поля формы"),
+    (re.compile(r"\.Тело(?![\w])"), "тело HTTP-запроса или ответа"),
+    (re.compile(r"(?<![\w])Параметры\s*\.\s*(?:Получить|ПолучитьПервый|ПолучитьИлиНеопределено|ПолучитьВсе)\s*\("),
+     "параметр адреса"),
+)
+
+
+def _redirect_source(expr: str, tainted: dict[str, str]) -> str | None:
+    if _FIXED_HOST.match(expr):
+        return None
+    expr = _strip_literals(expr)
+    for pattern, why in _REDIRECT_SOURCES:
+        if pattern.search(expr):
+            return why
+    for name, why in tainted.items():
+        if re.search(rf"(?<![\w.]){re.escape(name)}(?![\w])", expr):
+            return why
+    return None
+
+
+@rule("ПР-24", "Открытый переход", "S", severity=Severity.WARNING)
+def open_redirect(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, _annotations, header, body in _methods_with_headers(source.text):
+        tainted: dict[str, str] = {}
+        flat = header.replace("\n", " ")
+        if name == "ПриОткрытииПоСсылке":
+            for p in _PARAM_NAME.findall(flat):
+                tainted[p] = f"параметр {p} — адрес, по которому открыли страницу"
+        for p in _URL_PARAMS.findall(flat):
+            tainted[p] = f"параметр {p} — параметры адреса"
+        for p in _HTTP_PARAM.findall(flat):
+            tainted[p] = f"параметр {p} — запрос к HTTP-сервису"
+        first = line + header.count("\n") + 1
+        for k, text_line in enumerate(body, first):
+            code = _code_part(text_line)
+            if _REDIRECT_DECL.match(code):
+                continue
+            for m in _REDIRECT_CALL.finditer(code):
+                args = _call_args(code, m.end() - 1)
+                if not args or not args[0].strip():
+                    continue
+                why = _redirect_source(args[0], tainted)
+                if why is None:
+                    continue
+                call = m.group(0).rstrip("( ")
+                out.append(Diagnostic(
+                    source.rel, k, m.start() + 1, "ПР-24", Severity.WARNING,
+                    f"Метод '{name}': адрес {call} — извне ({why}). По такой ссылке приложение "
+                    f"уведёт пользователя на чужой сайт от своего имени. Брать адрес из настройки "
+                    f"или НавигационнаяСсылка, а пришедший — сверять с перечнем разрешённых.",
+                ))
+            a = _ASSIGN.match(code)
+            if a and a.group(1) not in tainted:
+                why = _redirect_source(a.group(2), tainted)
+                if why is not None:
+                    tainted[a.group(1)] = why
     return out

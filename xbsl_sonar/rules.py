@@ -793,6 +793,35 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-601",
         effort_minutes=15,
     ),
+    "ПР-25": RuleText(
+        code="ПР-25",
+        name="Внешний HTTP-запрос без предела ожидания",
+        description=(
+            "<p>Сервис на той стороне завис — ответа нет, а соединение не рвётся. Без предела "
+            "ожидания запрос ждёт столько, сколько продержится соединение: задание, кнопка "
+            "пользователя или обработчик HTTP-сервиса держат сеанс сервера, и такие сеансы "
+            "копятся. Значения по умолчанию у <code>ТаймаутЗапроса</code> в документации "
+            "платформы нет.</p>"
+            "<p><b>Находка:</b> <code>.Выполнить()</code> у запроса <code>КлиентHttp</code>, "
+            "у которого ни в цепочке клиента (<code>СТаймаутомЗапроса(…)</code>), ни в цепочке "
+            "запроса (<code>УстановитьТаймаутЗапроса(…)</code>) нет предела ожидания ответа — "
+            "одной цепочкой или через переменную метода, в которую положен клиент или запрос.</p>"
+            "<p><b>Не находка:</b> предел, заданный клиенту или запросу раньше в том же методе; "
+            "<code>Выполнить()</code> запроса к базе (<code>Запрос{…}</code>, "
+            "<code>новый Запрос(…)</code>) и любого другого объекта, кроме <code>КлиентHttp</code>. "
+            "Предел соединения (<code>СТаймаутомСоединения</code>) находку не снимает: соединение "
+            "установлено, а ответа нет.</p>"
+            "<p><b>Как исправить:</b> задать <code>.СТаймаутомЗапроса(15с)</code> там, где "
+            "строится клиент, или <code>.УстановитьТаймаутЗапроса(…)</code> у запроса; ошибку "
+            "по истечении — поймать и обработать (<code>ИсключениеHttp</code>).</p>"
+            "<p>CWE-1088: Synchronous Access of Remote Resource without Timeout "
+            "(ISO/IEC 5055, надёжность и эффективность).</p>"
+        ),
+        type="CODE_SMELL",
+        severity="MAJOR",
+        cwe="CWE-1088",
+        effort_minutes=5,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -3283,4 +3312,48 @@ def open_redirect(source: SourceFile) -> Iterable[Diagnostic]:
                 why = _redirect_source(a.group(2), tainted)
                 if why is not None:
                     tainted[a.group(1)] = why
+    return out
+
+
+# ПР-25: внешний HTTP-запрос без предела ожидания. `.Выполнить()` у запроса `КлиентHttp`, у которого
+# ни в цепочке клиента (`СТаймаутомЗапроса`), ни в цепочке запроса (`УстановитьТаймаутЗапроса`) нет
+# предела ожидания ответа: значения по умолчанию у `ТаймаутЗапроса` в документации платформы нет,
+# и зависший сервис держит сеанс сервера без конца. Предел соединения ответа не ограничивает.
+# Клиент или запрос, положенный в переменную метода, прослеживается: предел, заданный ей раньше,
+# засчитывается. `Запрос{…}.Выполнить()` и прочие `Выполнить` без `КлиентHttp` — не находка.
+_HTTP_CLIENT = re.compile(r"(?<![\w.])КлиентHttp(?![\w])")
+_HTTP_TIMEOUT = re.compile(r"\.\s*(?:СТаймаутомЗапроса|УстановитьТаймаутЗапроса)\s*\(")
+_HTTP_EXECUTE = re.compile(r"\.\s*Выполнить\s*\(")
+_HTTP_ASSIGN = re.compile(r"^\s*(?:(?:знч|пер|исп)\s+)?(\w+)(?:\s*:\s*[^=]+?)?\s*=(?!=)\s*(.+)$", re.DOTALL)
+
+
+def _http_vars_in(expr: str, http: dict[str, bool]) -> list[str]:
+    return [name for name in http if re.search(rf"(?<![\w.]){re.escape(name)}(?![\w])", expr)]
+
+
+@rule("ПР-25", "Внешний HTTP-запрос без предела ожидания", "D", severity=Severity.WARNING)
+def http_without_timeout(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, _annotations, header, body in _methods_with_headers(source.text):
+        # Имя переменной → задан ли предел ожидания запроса у клиента или запроса в ней
+        http: dict[str, bool] = {}
+        first = line + header.count("\n") + 1
+        for n, stmt in _statements([(first + k, text) for k, text in enumerate(body)]):
+            uses = _http_vars_in(stmt, http)
+            is_http = bool(_HTTP_CLIENT.search(stmt)) or bool(uses)
+            limited = bool(_HTTP_TIMEOUT.search(stmt)) or any(http[v] for v in uses)
+            if is_http and _HTTP_EXECUTE.search(stmt) and not limited:
+                out.append(Diagnostic(
+                    source.rel, n, 1, "ПР-25", Severity.WARNING,
+                    f"Метод '{name}': внешний HTTP-запрос без предела ожидания ответа — зависший "
+                    f"сервис держит сеанс сервера без конца. Задать .СТаймаутомЗапроса(…) у клиента "
+                    f"или .УстановитьТаймаутЗапроса(…) у запроса.",
+                ))
+            a = _HTTP_ASSIGN.match(stmt)
+            if a and is_http and not _HTTP_EXECUTE.search(a.group(2)):
+                http[a.group(1)] = limited
+            elif a and a.group(1) in http:
+                del http[a.group(1)]
     return out

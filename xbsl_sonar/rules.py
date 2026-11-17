@@ -822,6 +822,34 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-1088",
         effort_minutes=5,
     ),
+    "ПР-26": RuleText(
+        code="ПР-26",
+        name="Ответ HTTP-сервиса с данными без Cache-Control: no-store",
+        description=(
+            "<p>Ответ без запрета кеширования может сохранить браузер, прокси или сеть доставки "
+            "и отдать его следующему, кто спросит тот же адрес, — данные одного пользователя "
+            "или устаревший ответ уходят другому. Данные HTTP-сервиса — ответ на конкретный "
+            "запрос, кешировать их некому.</p>"
+            "<p><b>Находка:</b> в модуле HTTP-сервиса (пара <code>.yaml</code> — "
+            "<code>ВидЭлемента: HttpСервис</code>) метод ставит тело ответа "
+            "<code>.УстановитьТело(…)</code> строкой или JSON — строковым литералом, "
+            "интерполированной строкой, <code>СериализацияJson.…</code>, прямо или через "
+            "переменную метода, — а заголовок <code>Cache-Control</code> со значением, "
+            "содержащим <code>no-store</code>, в этом же методе не ставит.</p>"
+            "<p><b>Не находка:</b> <code>no-store</code> поставлен в том же методе — до тела "
+            "или после; тело — файл, поток или двоичный объект (картинку и вложение кешировать "
+            "можно); запрос <code>КлиентHttp</code> — это не ответ; модуль не HTTP-сервиса.</p>"
+            "<p><b>Как исправить:</b> рядом с телом — "
+            "<code>Запрос.Ответ.Заголовки.Установить(\"Cache-Control\", \"no-store\")</code>; "
+            "ответы с данными удобно собирать одним методом, который ставит и тип, и заголовок.</p>"
+            "<p>CWE-524: Use of Cache Containing Sensitive Information "
+            "(OWASP A04:2021 Insecure Design).</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MINOR",
+        cwe="CWE-524",
+        effort_minutes=5,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -3356,4 +3384,51 @@ def http_without_timeout(source: SourceFile) -> Iterable[Diagnostic]:
                 http[a.group(1)] = limited
             elif a and a.group(1) in http:
                 del http[a.group(1)]
+    return out
+
+
+# ПР-26: ответ HTTP-сервиса с данными без `Cache-Control: no-store`. Только модули элементов
+# `ВидЭлемента: HttpСервис`. Данные — тело `.УстановитьТело(…)` из строкового литерала (в том
+# числе интерполированного) или `СериализацияJson.…`, прямо или через переменную метода; файл,
+# поток, двоичный объект — не данные. `no-store` засчитывается в том же методе, до тела или после:
+# ответ уходит, когда обработчик закончился. Запрос `КлиентHttp` с телом — не ответ.
+_SET_BODY = re.compile(r"\.\s*(?:УстановитьТело|SetBody)\s*\(")
+_NO_STORE = re.compile(r"""["']Cache-Control["']\s*,\s*["'][^"']*no-store""", re.IGNORECASE)
+_DATA_BODY = re.compile(r'^\s*"|(?<![\w.])(?:СериализацияJson|JsonSerialization)\s*\.')
+
+
+@rule("ПР-26", "Ответ HTTP-сервиса с данными без Cache-Control: no-store", "S",
+      severity=Severity.WARNING)
+def http_response_without_no_store(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    yaml_text = _read_pair(source.path, ".yaml")
+    if not yaml_text or not _HTTP_KIND.search(yaml_text):
+        return []
+    out: list[Diagnostic] = []
+    for name, line, _annotations, header, body in _methods_with_headers(source.text):
+        if any(_NO_STORE.search(_code_part(text)) for text in body):
+            continue
+        first = line + header.count("\n") + 1
+        data_vars: set[str] = set()
+        for n, stmt in _statements([(first + k, text) for k, text in enumerate(body)]):
+            a = _HTTP_ASSIGN.match(stmt)
+            if a and not _SET_BODY.search(stmt):
+                if _DATA_BODY.search(a.group(2)):
+                    data_vars.add(a.group(1))
+                else:
+                    data_vars.discard(a.group(1))
+            m = _SET_BODY.search(stmt)
+            if not m or _HTTP_CLIENT.search(stmt):
+                continue
+            arg = ",".join(_call_args(stmt, m.end() - 1))
+            if not (_DATA_BODY.search(arg) or any(
+                    re.search(rf"(?<![\w.]){re.escape(v)}(?![\w])", arg) for v in data_vars)):
+                continue
+            out.append(Diagnostic(
+                source.rel, n, 1, "ПР-26", Severity.WARNING,
+                f"Метод '{name}': ответ HTTP-сервиса с данными без заголовка Cache-Control: no-store — "
+                f"браузер или прокси может сохранить ответ и отдать его другому. Поставить "
+                f"Запрос.Ответ.Заголовки.Установить(\"Cache-Control\", \"no-store\") в этом методе.",
+            ))
     return out

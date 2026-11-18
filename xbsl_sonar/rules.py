@@ -850,6 +850,33 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-524",
         effort_minutes=5,
     ),
+    "ПР-27": RuleText(
+        code="ПР-27",
+        name="Секрет сравнивается не за постоянное время",
+        description=(
+            "<p>Обычное сравнение строк заканчивается на первом несовпавшем символе: чем больше "
+            "начальных символов угадано, тем дольше ответ. Перебирая значение и замеряя время, "
+            "можно восстановить токен или подпись по символу.</p>"
+            "<p><b>Находка:</b> сравнение <code>==</code> или <code>!=</code>, одна сторона "
+            "которого — секрет, а другая — не литерал. Секрет — значение заголовка HTTP-запроса "
+            "(<code>Заголовки.ПолучитьПервый(…)</code>, <code>Заголовки.Получить(…)</code>), "
+            "вызов, переменная или поле с «секретным» именем (<code>Токен…</code>, "
+            "<code>Секрет…</code>, <code>Пароль…</code>, <code>Подпись…</code>) — прямо или "
+            "через переменную метода, которой оно присвоено.</p>"
+            "<p><b>Не находка:</b> другая сторона — литерал (<code>Ключ == \"\"</code>, "
+            "<code>Токен == Неопределено</code>, число, <code>Истина</code>); длина или размер "
+            "(<code>Токен.Длина() == 0</code>); значение перечисления "
+            "(<code>Вид == ВидНастройки.Токен</code>).</p>"
+            "<p><b>Как исправить:</b> сравнивать за постоянное время — обе стороны прогнать "
+            "через HMAC с ключом сервера и сравнить результаты, либо сравнить посимвольно "
+            "без раннего выхода (сумма различий по всей длине).</p>"
+            "<p>CWE-208: Observable Timing Discrepancy.</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MINOR",
+        cwe="CWE-208",
+        effort_minutes=10,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -3431,4 +3458,105 @@ def http_response_without_no_store(source: SourceFile) -> Iterable[Diagnostic]:
                 f"браузер или прокси может сохранить ответ и отдать его другому. Поставить "
                 f"Запрос.Ответ.Заголовки.Установить(\"Cache-Control\", \"no-store\") в этом методе.",
             ))
+    return out
+
+
+# ПР-27: секрет сравнивается обычным `==` / `!=` — время ответа выдаёт совпавшее начало. Секрет —
+# заголовок HTTP-запроса, вызов, переменная или поле с «секретным» именем (`Подпись` — только вызов),
+# или переменная метода,
+# которой такое присвоено. Другая сторона — литерал (после `_statements` строка — `""`), длина,
+# размер или пустота — не находка: сравнивать там нечего угадывать. Значение перечисления
+# (`ВидНастройки.Токен…`) — тоже: это вид, а не значение секрета.
+_PR27_SECRET_WORD = r"(?:Токен|Секрет|Пароль|Token|Secret|Password)"
+# «Подпись» — ещё и надпись интерфейса (`Подпись.Шрифт`): секрет она только как вызов `Подпись(…)`
+_PR27_SECRET_NAME = re.compile(
+    rf"(?<![\w])(?:\w*{_PR27_SECRET_WORD}\w*(?![\w])|\w*(?:Подпись|Signature)\w*(?=\s*\())")
+_PR27_HEADER_READ = re.compile(r"\.\s*(?:Заголовки|Headers)\s*\.\s*(?:ПолучитьПервый|Получить|GetFirst|Get)\s*\(")
+_PR27_ENUM_VALUE = re.compile(r"^\s*(?:Вид\w*|Виды\w*|\w*Перечисление\w*)\s*\.\s*\w+\s*$")
+_PR27_NOT_SECRET_SIDE = re.compile(
+    r'^\s*(?:""|-?\d+(?:\.\d+)?|Неопределено|Undefined|Истина|Ложь|True|False|Null|NULL)\s*$'
+    r"|\.\s*(?:Длина|Размер|Пусто|Length|Size|IsEmpty)\s*\(\s*\)\s*$")
+_PR27_COMPARE = re.compile(r"(?<![=!<>])(==|!=)(?!=)")
+_PR27_STOP_WORDS = re.compile(r"(?<![\w])(?:если|иначе|и|или|не|возврат|пока|когда|if|else|and|or|not|return)(?![\w])")
+
+
+def _pr27_operand(stmt: str, pos: int, step: int) -> str:
+    """Операнд сравнения от позиции `pos` в сторону `step`: до скобки, запятой, `?`, `:`,
+    `=` присваивания или служебного слова на нулевой глубине."""
+    depth = 0
+    i = pos
+    while 0 <= i < len(stmt):
+        c = stmt[i]
+        if c in "([{" if step > 0 else c in ")]}":
+            depth += 1
+        elif c in ")]}" if step > 0 else c in "([{":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (c in ",?:;" or (c == "=" and step < 0)):
+            break
+        i += step
+    part = stmt[pos:i] if step > 0 else stmt[i + 1:pos + 1]
+    words = list(_PR27_STOP_WORDS.finditer(part))
+    if words:
+        part = part[:words[0].start()] if step > 0 else part[words[-1].end():]
+    return part.strip()
+
+
+def _pr27_secret_side(expr: str, secret: dict[str, str]) -> str | None:
+    if not expr or _PR27_NOT_SECRET_SIDE.search(expr) or _PR27_ENUM_VALUE.match(expr):
+        return None
+    if _PR27_HEADER_READ.search(expr):
+        return "значение заголовка запроса"
+    for v, why in secret.items():
+        if re.search(rf"(?<![\w.]){re.escape(v)}(?![\w])", expr):
+            return why
+    m = _PR27_SECRET_NAME.search(expr)
+    if m:
+        return f"«{m.group(0)}»"
+    return None
+
+
+@rule("ПР-27", "Секрет сравнивается не за постоянное время", "S", severity=Severity.WARNING)
+def secret_compared_in_variable_time(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, _annotations, header, body in _methods_with_headers(source.text):
+        secret: dict[str, str] = {}
+        first = line + header.count("\n") + 1
+        for n, stmt in _statements([(first + k, text) for k, text in enumerate(body)]):
+            for m in _PR27_COMPARE.finditer(stmt):
+                left = _pr27_operand(stmt, m.start() - 1, -1)
+                right = _pr27_operand(stmt, m.end(), 1)
+                if not left or not right:
+                    continue
+                if _PR27_NOT_SECRET_SIDE.search(left) or _PR27_NOT_SECRET_SIDE.search(right):
+                    continue
+                if _PR27_ENUM_VALUE.match(left) or _PR27_ENUM_VALUE.match(right):
+                    continue
+                why = _pr27_secret_side(left, secret) or _pr27_secret_side(right, secret)
+                if why is None:
+                    continue
+                out.append(Diagnostic(
+                    source.rel, n, 1, "ПР-27", Severity.WARNING,
+                    f"Метод '{name}': секрет ({why}) сравнивается через {m.group(1)} — сравнение "
+                    f"кончается на первом несовпавшем символе, и время ответа выдаёт угаданное "
+                    f"начало. Сравнивать за постоянное время.",
+                ))
+            a = _HTTP_ASSIGN.match(stmt)
+            if a and not _PR27_COMPARE.search(a.group(2)):
+                why = None
+                if _PR27_HEADER_READ.search(a.group(2)):
+                    why = f"{a.group(1)} — значение заголовка запроса"
+                elif re.fullmatch(rf"\w*{_PR27_SECRET_WORD}\w*", a.group(1)):
+                    why = f"{a.group(1)}"
+                else:
+                    src = _pr27_secret_side(a.group(2), secret)
+                    if src is not None:
+                        why = f"{a.group(1)} — {src}"
+                if why is not None:
+                    secret[a.group(1)] = why
+                else:
+                    secret.pop(a.group(1), None)
     return out

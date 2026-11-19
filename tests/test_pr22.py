@@ -33,11 +33,27 @@ def data_dir(tmp_path_factory) -> Path:
     return data.build(HELP, tmp_path_factory.mktemp("data"))
 
 
-def check(tmp_path, monkeypatch, data_dir, code: str, yaml: str = OPEN_YAML) -> tuple[int, list[dict]]:
+# Сущность, к которой обращаются обработчики: права выданы всем, включая неавторизованных
+DATA_OPEN = """\
+ВидЭлемента: Справочник
+Имя: Данные
+КонтрольДоступа:
+    Разрешения:
+        ПоУмолчанию: {права}
+"""
+
+
+def check(tmp_path, monkeypatch, data_dir, code: str, yaml: str = OPEN_YAML,
+          rights: str | None = "РазрешеноВсем") -> tuple[int, list[dict]]:
     module = tmp_path / "IT" / "Проект" / "Основное" / "Сервис.xbsl"
-    module.parent.mkdir(parents=True)
+    module.parent.mkdir(parents=True, exist_ok=True)
     module.write_text(textwrap.dedent(code).lstrip(), encoding="utf-8")
     module.with_suffix(".yaml").write_text(yaml, encoding="utf-8")
+    entity = module.with_name("Данные.yaml")
+    if rights == "":
+        entity.write_text("ВидЭлемента: Справочник\nИмя: Данные\n", encoding="utf-8")
+    elif rights:
+        entity.write_text(DATA_OPEN.format(права=rights), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     rc = cli.main(["check", "IT", "--data-dir", str(data_dir), "--json", "находки.json",
                    "--rules", "ПР-22"])
@@ -202,3 +218,48 @@ def test_not_http_service(tmp_path, monkeypatch, data_dir):
         ;
     """, yaml=yaml)
     assert (rc, found) == (0, [])
+
+
+@pytest.mark.parametrize("rights", ["РазрешеноАутентифицированным", "РазрешеноАдминистраторам", ""])
+def test_data_closed_to_anonymous_is_not_a_finding(tmp_path, monkeypatch, data_dir, rights):
+    # без повышения прав аноним работает с данными по своим правам: прав для неавторизованных нет —
+    # платформа откажет сама
+    rc, found = check(tmp_path, monkeypatch, data_dir, """
+        метод Принять(Запрос: HttpСервисЗапрос)
+            Запрос.Ответ.УстановитьТело(СериализацияJson.ЗаписатьОбъект(Данные.Все()))
+        ;
+    """, rights=rights)
+    assert (rc, found) == (0, [])
+
+
+def test_privileged_in_called_module_is_a_finding(tmp_path, monkeypatch, data_dir):
+    rc, found = check(tmp_path, monkeypatch, data_dir, """
+        метод Принять(Запрос: HttpСервисЗапрос)
+            Обработка.Выполнить(Запрос)
+        ;
+    """, rights="РазрешеноАдминистраторам")
+    folder = tmp_path / "IT" / "Проект" / "Основное"
+    (folder / "Обработка.xbsl").write_text(textwrap.dedent("""
+        @ВПроекте
+        метод Выполнить(Запрос: HttpСервисЗапрос)
+            исп КонтекстДоступа.Привилегированный()
+            Данные.Добавить(Запрос.Тело.ПрочитатьКакСтроку())
+        ;
+    """).lstrip(), encoding="utf-8")
+    rc = cli.main(["check", "IT", "--data-dir", str(data_dir), "--json", "находки.json", "--rules", "ПР-22"])
+    found = json.loads((tmp_path / "находки.json").read_text(encoding="utf-8"))["findings"]
+    assert rc == 1
+    assert lines(found) == [("ПР-22", 1)]
+
+
+def test_same_name_in_other_subsystem_does_not_hide_open_data(tmp_path, monkeypatch, data_dir):
+    other = tmp_path / "IT" / "Проект" / "Другое" / "Данные.yaml"
+    other.parent.mkdir(parents=True)
+    other.write_text(DATA_OPEN.format(права="РазрешеноАдминистраторам"), encoding="utf-8")
+    rc, found = check(tmp_path, monkeypatch, data_dir, """
+        метод Принять(Запрос: HttpСервисЗапрос)
+            Запрос.Ответ.УстановитьТело(СериализацияJson.ЗаписатьОбъект(Данные.Все()))
+        ;
+    """)
+    assert rc == 1
+    assert lines(found) == [("ПР-22", 1)]

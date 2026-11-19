@@ -3414,6 +3414,88 @@ def _touches_data(header: str, parts: list[str]) -> bool:
     return any(head not in own for head in _CHAIN_HEAD.findall(text))
 
 
+# Без повышения прав обработчик работает с данными по правам вызывающего — анонима; данные ему
+# открыты, только если права сущности выданы всем: значение `РазрешеноВсем` в YAML или ключ
+# `КлючДоступаДляВсех` в расчёте разрешений. Прав для неавторизованных нет — платформа откажет сама.
+_ELEVATED = re.compile(r"\b(?:Привилегированный|Privileged|Дополнить|Extend)\s*\(")
+_DATA_KIND = re.compile(r"^ВидЭлемента:\s*(?:Справочник|Документ|РегистрСведений|РегистрНакопления|НаборКонстант"
+                        r"|ПланОбмена|Catalog|Document|InformationRegister|AccumulationRegister|ConstantsSet)\s*$",
+                        re.MULTILINE)
+_ANY_RIGHT_LINE = re.compile(r"^\s*(?:Чтение|Создание|Изменение|Удаление|ПоУмолчанию|Read|Create|Update|Delete"
+                             r"|Default):\s*(\w+)\s*$", re.MULTILINE)
+_EVERYONE_KEY = re.compile(r"\bКлючДоступаДляВсех\b")
+_FROM_TABLE = re.compile(r"\b(?:ИЗ|СОЕДИНЕНИЕ|FROM|JOIN)\s+(\w+)", re.IGNORECASE)
+_HEAD_NAME = re.compile(r"(?<![\w.])([А-ЯЁA-Z]\w*)\s*\.")
+_PROJECTS: dict[str, tuple[dict[str, list[tuple[str, dict[str, str]]]],
+                            dict[str, list[tuple[str, str, str | None]]]]] = {}
+
+
+def _project_index(source: SourceFile):
+    """Модули и сущности проекта, к которому относится файл (каталог с `Проект.yaml` выше по пути,
+    иначе — два уровня вверх): имя модуля → [(каталог, метод → тело)]; имя сущности →
+    [(каталог, YAML, модуль типа)]. Имена в разных подсистемах повторяются — поэтому списком."""
+    root = next((p for p in source.path.parents if (p / "Проект.yaml").is_file()), source.path.parent.parent)
+    key = str(root)
+    if key not in _PROJECTS:
+        modules: dict[str, dict[str, dict[str, str]]] = {}
+        entities: dict[str, list[tuple[str, str, str | None]]] = {}
+        for path in root.rglob("*.xbsl"):
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+            modules.setdefault(path.name.split(".")[0], {}).setdefault(str(path.parent), {}).update(_text_bodies(text))
+        for path in root.rglob("*.yaml"):
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+            if _DATA_KIND.search(text):
+                module = path.with_suffix(".xbsl")
+                entities.setdefault(path.stem, []).append((str(path.parent), text, module.read_text(
+                    encoding="utf-8-sig", errors="replace") if module.is_file() else None))
+        _PROJECTS[key] = ({name: list(dirs.items()) for name, dirs in modules.items()}, entities)
+    return _PROJECTS[key]
+
+
+def _nearest(candidates: list, folder: str) -> list:
+    """Кандидаты одного имени: из того же каталога, если есть, иначе все."""
+    same = [c for c in candidates if c[0] == folder]
+    return same or candidates
+
+
+def _open_to_anonymous(described: str, type_module: str | None) -> bool:
+    """Права сущности выданы всем, включая неавторизованных."""
+    values = _ANY_RIGHT_LINE.findall(described)
+    if any(value in _OPEN_TO_ALL for value in values):
+        return True
+    if type_module and any(v in _COMPUTED for v in values):
+        return any(name in _PERMISSION_HANDLERS and _EVERYONE_KEY.search(body)
+                   for name, body in _text_bodies(type_module).items())
+    return False
+
+
+def _reaches_anonymous_data(source: SourceFile, handler: str) -> bool:
+    """Обработчик сам или через методы проекта повышает права — или без повышения обращается
+    к сущности, права которой выданы всем. Одноимённые модули и сущности берутся из каталога
+    того же модуля; нет там — все кандидаты (осторожно: открыт хоть один — открыто)."""
+    modules, entities = _project_index(source)
+    seen: set[tuple[str, str, str]] = set()
+    stack = [(str(source.path.parent), source.path.name.split(".")[0], handler)]
+    open_found = False
+    while stack:
+        folder, module, method = stack.pop()
+        for directory, methods in _nearest(modules.get(module, []), folder):
+            if (directory, module, method) in seen or method not in methods:
+                continue
+            seen.add((directory, module, method))
+            code = "\n".join(_code_part(line) for line in methods[method].splitlines())
+            if _ELEVATED.search(code):
+                return True
+            names = {module} | set(_FROM_TABLE.findall(code)) | set(_HEAD_NAME.findall(code))
+            for name in names & entities.keys():
+                if any(_open_to_anonymous(text, type_module)
+                       for _d, text, type_module in _nearest(entities[name], directory)):
+                    open_found = True
+            for q, called in _TEXT_CALL.findall(_strip_literals(code)):
+                stack.append((directory, q or module, called))
+    return open_found
+
+
 @rule("ПР-22", "HTTP-сервис открыт всем, а обработчик не проверяет допуск", "S",
       severity=Severity.WARNING)
 def open_http_handler(source: SourceFile) -> Iterable[Diagnostic]:
@@ -3435,6 +3517,8 @@ def open_http_handler(source: SourceFile) -> Iterable[Diagnostic]:
         if headers and denied:
             continue
         if not _touches_data(methods.get(handler, (1, ""))[1], parts):
+            continue
+        if not _reaches_anonymous_data(source, handler):
             continue
         reported.add(handler)
         missing = "ни чтения заголовка, ни отказа 401/403" if not (headers or denied) else (
@@ -3565,14 +3649,45 @@ def _constructor_fields(expr: str) -> list[tuple[str, str]]:
     return out
 
 
+_FORM_OF_ANY = re.compile(r"(?:ФормаОбъекта|ФормаЗаписи\w*|ObjectForm|RecordForm\w*)<(\w+)\.")
+_READ_LINE = re.compile(r"^\s*(Чтение|ПоУмолчанию|Read|Default):\s*(\w+)\s*$", re.MULTILINE)
+
+
+def _admin_only_form(source: SourceFile) -> bool:
+    """Модуль формы объекта или записи (пара `.yaml` рядом), сущность которой читают только
+    администраторы: `Чтение`, а без него `ПоУмолчанию`, — `РазрешеноАдминистраторам` (по `Тип.yaml`
+    рядом или уровнем выше). Контекстный метод такой формы зовётся только из открытой формы,
+    а открыть её платформа даёт тому, кому разрешено читать её данные."""
+    described = _read_pair(source.path, ".yaml")
+    m = _FORM_OF_ANY.search(described or "")
+    if not m:
+        return False
+    for folder in (source.path.parent, source.path.parent.parent):
+        try:
+            entity = (folder / (m.group(1) + ".yaml")).read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        rights = dict(_READ_LINE.findall(entity))
+        value = rights.get("Чтение") or rights.get("Read") or rights.get("ПоУмолчанию") or rights.get("Default")
+        return value in _ADMINS_ONLY
+    return False
+
+
 @rule("ПР-23", "Секрет уходит на клиент", "S", severity=Severity.WARNING)
 def secret_to_client(source: SourceFile) -> Iterable[Diagnostic]:
     if source.kind != "xbsl":
         return []
     out: list[Diagnostic] = []
+    admin_form: bool | None = None
     for name, line, annotations, header, body in _methods_with_headers(source.text):
         if not annotations & _FROM_CLIENT:
             continue
+        # Секрет показывается тому, кто и так вправе читать данные формы, — намеренно
+        if annotations & {"Контекстный", "Contextual"}:
+            if admin_form is None:
+                admin_form = _admin_only_form(source)
+            if admin_form:
+                continue
         rtype = _RETURN_TYPE.search(header.replace("\n", " "))
         returns = rtype.group(1).strip() if rtype else ""
         params = re.search(r"\((.*)\)", header.replace("\n", " "), re.DOTALL)

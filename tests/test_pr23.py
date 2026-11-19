@@ -164,3 +164,51 @@ def test_exception_mark(tmp_path, monkeypatch, data_dir):
     """)
     assert rc == 0
     assert [f.get("debt") for f in found] == ["ТД-1"]
+
+
+FORM_MODULE = """
+    @НаСервере @ДоступноСКлиента
+    @Контекстный
+    метод КлючДляКопирования(): Строка
+        возврат Запись.ТокенСервиса.Раскрыть()
+    ;
+"""
+
+FORM_YAML = """
+    ВидЭлемента: КомпонентИнтерфейса
+    Имя: НастройкиСервисаФорма
+    Наследует:
+        Тип: ФормаЗаписиНабораКонстант<НастройкиСервиса.Запись>
+"""
+
+SETTINGS_YAML = """
+    ВидЭлемента: НаборКонстант
+    Имя: НастройкиСервиса
+    КонтрольДоступа:
+        Разрешения:
+            Чтение: {чтение}
+"""
+
+
+def check_form(tmp_path, monkeypatch, data_dir, reading: str) -> tuple[int, list[dict]]:
+    folder = tmp_path / "IT" / "Проект" / "Основное"
+    folder.mkdir(parents=True)
+    for name, code in {"НастройкиСервисаФорма.xbsl": FORM_MODULE, "НастройкиСервисаФорма.yaml": FORM_YAML,
+                       "НастройкиСервиса.yaml": SETTINGS_YAML.format(чтение=reading)}.items():
+        (folder / name).write_text(textwrap.dedent(code).lstrip(), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["check", "IT", "--data-dir", str(data_dir), "--json", "находки.json",
+                   "--rules", "ПР-23"])
+    return rc, json.loads((tmp_path / "находки.json").read_text(encoding="utf-8"))["findings"]
+
+
+def test_contextual_method_of_admin_only_form_is_not_a_finding(tmp_path, monkeypatch, data_dir):
+    # данные формы читают только администраторы: секрет видит тот, кто и так вправе его прочитать
+    rc, found = check_form(tmp_path, monkeypatch, data_dir, "РазрешеноАдминистраторам")
+    assert (rc, found) == (0, [])
+
+
+def test_contextual_method_of_form_open_to_others_is_a_finding(tmp_path, monkeypatch, data_dir):
+    rc, found = check_form(tmp_path, monkeypatch, data_dir, "РазрешеноАутентифицированным")
+    assert rc == 1
+    assert lines(found) == [("ПР-23", 4)]

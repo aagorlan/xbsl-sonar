@@ -877,6 +877,34 @@ RULES: dict[str, RuleText] = {
         cwe="CWE-208",
         effort_minutes=10,
     ),
+    "ПР-28": RuleText(
+        code="ПР-28",
+        name="Решение о правах по признаку из параметра клиента",
+        description=(
+            "<p>Метод с аннотацией <code>@ДоступноСКлиента</code> вызывается из браузера, и любой "
+            "его параметр клиент передаёт сам. Признак вида <code>ЭтоАдминистратор: Булево</code> "
+            "в таком параметре — не право, а просьба: передав <code>Истина</code>, пользователь "
+            "пропускает проверку.</p>"
+            "<p><b>Находка:</b> у метода <code>@ДоступноСКлиента</code> параметр типа "
+            "<code>Булево</code> с «правовым» именем (<code>…Администратор…</code>, "
+            "<code>…Модератор…</code>, <code>…Привилег…</code>, <code>БезПроверки…</code>, "
+            "<code>ПропуститьПроверку…</code>, <code>…Разрешен…</code>, <code>…Права…</code>, "
+            "<code>…Роль…</code>) входит в условие <code>если</code>, в блоке которого — "
+            "вместе с ветвями <code>иначе</code> — есть <code>выбросить</code> или "
+            "<code>КонтекстДоступа.Привилегированный()</code>.</p>"
+            "<p><b>Не находка:</b> признак, вычисленный на сервере "
+            "(<code>ОбщийМодуль.ЭтоАдминистратор()</code>); такой параметр у метода без доступа "
+            "с клиента; параметр с «правовым» именем, который только передаётся дальше или "
+            "выбирает, что показать, без отказа и без повышения прав.</p>"
+            "<p><b>Как исправить:</b> убрать параметр и определять право на сервере — по текущему "
+            "пользователю.</p>"
+            "<p>CWE-807: Reliance on Untrusted Inputs in a Security Decision; CWE-602.</p>"
+        ),
+        type="VULNERABILITY",
+        severity="MAJOR",
+        cwe="CWE-807",
+        effort_minutes=10,
+    ),
 }
 
 RULE_IDS = tuple(RULES)
@@ -3559,4 +3587,72 @@ def secret_compared_in_variable_time(source: SourceFile) -> Iterable[Diagnostic]
                     secret[a.group(1)] = why
                 else:
                     secret.pop(a.group(1), None)
+    return out
+
+
+# ПР-28: решение о правах по признаку из параметра метода `@ДоступноСКлиента`. Параметр `Булево`
+# с «правовым» именем, входящий в условие `если`, в блоке которого (с ветвями `иначе`) есть отказ
+# `выбросить` или повышение прав `Привилегированный()`. Только `Булево` и только «правовые» имена:
+# любой параметр в условии с отказом — это и обычная проверка данных (`Область == Неопределено`).
+# С заглавной — начало слова в имени: «Справа» правом не считается
+_PR28_RIGHT_WORD = re.compile(
+    r"Администратор|Модератор|Привилег|БезПровер|ПропуститьПровер|Разрешен|Прав[оа]|Роль"
+    r"|[Aa]dmin|[Mm]oderator|[Pp]rivileg|[Ss]kipCheck|[Nn]oCheck|[Aa]llowed|(?<![a-z])[Rr]ole")
+_PR28_BOOL_PARAM = re.compile(r"[(,]\s*(\w+)\s*:\s*(?:Булево|Boolean)\??\s*(?:=[^,)]*)?(?=[,)])")
+_PR28_IF = re.compile(r"^\s*(?:если|if)\b")
+_PR28_ELSE_IF = re.compile(r"^\s*(?:иначе\s+если|else\s+if)\b")
+_PR28_OPEN = re.compile(r"^\s*(?:если|для|пока|попытка|выбор|if|for|while|try|case)\b")
+_PR28_CLOSE = re.compile(r"^\s*;\s*$")
+_PR28_GUARD = re.compile(r"(?<![\w])(?:выбросить|throw)(?![\w])|\.\s*(?:Привилегированный|Privileged)\s*\(",
+                         re.IGNORECASE)
+
+
+@rule("ПР-28", "Решение о правах по признаку из параметра клиента", "S", severity=Severity.WARNING)
+def rights_decided_by_client_flag(source: SourceFile) -> Iterable[Diagnostic]:
+    if source.kind != "xbsl":
+        return []
+    out: list[Diagnostic] = []
+    for name, line, annotations, header, body in _methods_with_headers(source.text):
+        if not annotations & _FROM_CLIENT:
+            continue
+        flags = [p for p in _PR28_BOOL_PARAM.findall(" ".join(header.splitlines()))
+                 if _PR28_RIGHT_WORD.search(p)]
+        if not flags:
+            continue
+        first = line + header.count("\n") + 1
+        code = [_strip_literals(_code_part(text)) for text in body]
+        reported: set[int] = set()
+        for k, text in enumerate(code):
+            if not _PR28_IF.match(text) or _PR28_ELSE_IF.match(text):
+                continue
+            condition = [text]
+            j = k + 1
+            while j < len(code) and _CONTINUED.match(code[j]):
+                condition.append(code[j])
+                j += 1
+            cond = " ".join(condition)
+            used = [p for p in flags if re.search(rf"(?<![\w.]){re.escape(p)}(?![\w])", cond)]
+            if not used:
+                continue
+            depth, block = 1, []
+            for later in code[j:]:
+                if _PR28_CLOSE.match(later):
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif _PR28_OPEN.match(later) and not _PR28_ELSE_IF.match(later):
+                    depth += 1
+                block.append(later)
+            if not any(_PR28_GUARD.search(b) for b in block):
+                continue
+            n = first + k
+            if n in reported:
+                continue
+            reported.add(n)
+            out.append(Diagnostic(
+                source.rel, n, 1, "ПР-28", Severity.WARNING,
+                f"Метод '{name}': право решается по параметру '{used[0]}', а его значение передаёт "
+                f"клиент — передав другое, пользователь обходит проверку. Определять право "
+                f"на сервере по текущему пользователю.",
+            ))
     return out

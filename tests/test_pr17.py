@@ -87,6 +87,37 @@ def test_expression_in_list_row_reaching_server(tmp_path, monkeypatch, data_dir)
     assert "'Строка.ЦветСостояния'" in found[0]["message"]
 
 
+CACHED_STATES = """
+    @ВПроекте
+    @НаСервере @ДоступноСКлиента(КешироватьРезультат = Истина)
+    статический метод Цвет(Состояние: Строка): Цвет
+        возврат Цвета.Зеленый
+    ;
+"""
+
+EMPTY_ARGS_STATES = """
+    @ВПроекте
+    @НаСервере @ДоступноСКлиента()
+    статический метод Цвет(Состояние: Строка): Цвет
+        возврат Цвета.Зеленый
+    ;
+"""
+
+
+def test_cached_result_is_not_a_finding(tmp_path, monkeypatch, data_dir):
+    # кеш результата на клиенте: сервер — только первый вызов за сеанс с теми же параметрами
+    rc, found = check(tmp_path, monkeypatch, data_dir, {
+        "Строка.yaml": ROW_YAML, "Строка.xbsl": ROW_XBSL, "Состояния.xbsl": CACHED_STATES})
+    assert (rc, found) == (0, [])
+
+
+def test_empty_annotation_arguments_still_reach_server(tmp_path, monkeypatch, data_dir):
+    rc, found = check(tmp_path, monkeypatch, data_dir, {
+        "Строка.yaml": ROW_YAML, "Строка.xbsl": ROW_XBSL, "Состояния.xbsl": EMPTY_ARGS_STATES})
+    assert rc == 1
+    assert [(f["rule"], f["line"]) for f in found] == [("ПР-17", 7)]
+
+
 def test_client_computation_is_not_a_finding(tmp_path, monkeypatch, data_dir):
     rc, found = check(tmp_path, monkeypatch, data_dir, {
         "Строка.yaml": ROW_YAML, "Строка.xbsl": ROW_XBSL, "Состояния.xbsl": CLIENT_STATES})

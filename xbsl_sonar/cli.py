@@ -36,6 +36,9 @@ _QUERY = re.compile(r"(?<![\w.])(?:Запрос|Query)\s*\{")
 
 _CALL = re.compile(r"(?<![\w.])(?:(\w+)\s*\.\s*)?(\w+)\s*\(")
 _ANNOTATION = re.compile(r"@(\w+)")
+# `@ДоступноСКлиента(КешироватьРезультат = Истина)`: сервер — только первый вызов за сеанс с теми же
+# параметрами, дальше клиент берёт ответ из кеша (справка, Std/Annotations/Environments/AvailableFromClient)
+_CACHED = re.compile(r"@ДоступноСКлиента\s*\([^)]*\bКешироватьРезультат\s*=\s*Истина\b")
 _ON_SERVER = {"НаСервере", "OnServer"}
 _ON_CLIENT = {"НаКлиенте", "OnClient"}
 _FROM_CLIENT = {"ДоступноСКлиента", "AvailableFromClient"}
@@ -86,40 +89,71 @@ def _bodies(paths: list[str]) -> tuple[dict[str, list[str]], dict[str, set[str]]
     return bodies, annotations
 
 
-def _closure(found: set[str], bodies: dict[str, list[str]]) -> set[str]:
+def _closure(found: set[str], bodies: dict[str, list[str]], skip: set[str] | None = None) -> set[str]:
     """Добавить к набору методы, которые вызывают метод из набора, — пока набор растёт.
-    Вызов без модуля относится к своему."""
+    Вызов без модуля относится к своему. Методы из `skip` в набор не входят и его не передают."""
+    skip = skip or set()
     calls: dict[str, set[str]] = {}
     for key, lines in bodies.items():
         own = key.split(".")[0]
         calls[key] = {f"{q or own}.{name}" for q, name in _CALL.findall("\n".join(lines))}
     while True:
-        more = {key for key, called in calls.items() if key not in found and called & found}
+        more = {key for key, called in calls.items()
+                if key not in found and key not in skip and called & found}
         if not more:
             return found
         found |= more
+
+
+def cached_methods(paths: list[str]) -> set[str]:
+    """Методы с `@ДоступноСКлиента(КешироватьРезультат = Истина)` — `Модуль.Метод`.
+
+    Их результат клиент держит в кеше сеанса: повторный вызов на сервер не ходит, поэтому для
+    ПР-16 и ПР-17 они не обращение к серверу при каждом срабатывании.
+    """
+    found: set[str] = set()
+    files: list[Path] = []
+    for p in map(Path, paths):
+        files.extend(sorted(p.rglob("*.xbsl")) if p.is_dir() else [p])
+    for file in files:
+        module = file.name.split(".")[0]
+        cached = False
+        for line in file.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = _METHOD.match(line)
+            if m:
+                if cached:
+                    found.add(f"{module}.{m.group(1)}")
+                cached = False
+            elif line.lstrip().startswith("@") and _CACHED.search(line):
+                cached = True
+    return found
 
 
 def server_methods(paths: list[str]) -> set[str]:
     """Методы, вызов которых доходит до сервера (для ПР-16), — `Модуль.Метод`.
 
     Серверный — с `@НаСервере` и без `@НаКлиенте`; набор замыкается по вызовам: клиентский
-    метод, зовущий серверный, тоже ходит на сервер.
+    метод, зовущий серверный, тоже ходит на сервер. Методы с кешем результата на клиенте
+    (`cached_methods`) не входят и вызов не передают.
     """
     bodies, annotations = _bodies(paths)
-    found = {key for key, ann in annotations.items() if ann & _ON_SERVER and not ann & _ON_CLIENT}
-    return _closure(found, bodies)
+    cached = cached_methods(paths)
+    found = {key for key, ann in annotations.items()
+             if ann & _ON_SERVER and not ann & _ON_CLIENT and key not in cached}
+    return _closure(found, bodies, cached)
 
 
 def data_methods(paths: list[str]) -> set[str]:
     """Методы, вызов которых доходит до сервера или базы (для ПР-17), — `Модуль.Метод`.
 
     Серверные (как для ПР-16) и методы с литералом `Запрос{…}`; набор замыкается по вызовам.
+    Методы с кешем результата на клиенте (`cached_methods`) не входят и вызов не передают.
     """
     bodies, annotations = _bodies(paths)
+    cached = cached_methods(paths)
     found = {key for key, ann in annotations.items() if ann & _ON_SERVER and not ann & _ON_CLIENT}
     found |= {key for key, lines in bodies.items() if _QUERY.search("\n".join(lines))}
-    return _closure(found, bodies)
+    return _closure(found - cached, bodies, cached)
 
 
 def unguarded_methods(paths: list[str]) -> set[str]:

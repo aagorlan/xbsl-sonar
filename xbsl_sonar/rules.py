@@ -1862,12 +1862,53 @@ _RIGHT_LINE = re.compile(r"^\s*(Изменение|ПоУмолчанию|Update
 _ADMINS_ONLY = {"РазрешеноАдминистраторам", "AllowedToAdministrators"}
 
 
-def _editable_by_others(yaml_text: str) -> bool:
+_COMPUTED = {"РазрешенияВычисляются", "РазрешенияВычисляютсяДляКаждогоОбъекта"}
+_PERMISSION_CALL = re.compile(r"(?<![\w.])РазрешениеДоступа\s*\(")
+_OPEN_KEY = re.compile(r"\bКлючДоступаДля(?:Всех|Аутентифицированных)\b")
+_CHANGE_RIGHT = re.compile(r"\bПраво\s*\.\s*(?:Изменение|Создание)\b")
+_ANY_RIGHT = re.compile(r"\bПраво\s*\.\s*\w+")
+_PERMISSION_HANDLERS = {"ВычислитьРазрешенияДоступа", "ВычислитьРазрешенияДоступаДляОбъектов"}
+
+
+def _call_arguments(text: str, start: int) -> str:
+    """Текст аргументов вызова от открывающей скобки на `start` до парной закрывающей."""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:i]
+    return text[start + 1:]
+
+
+def _computed_open(type_module: str | None) -> bool:
+    """Обработчики расчёта разрешений модуля типа выдают изменение или создание стандартному
+    ключу всех или всех вошедших. Права не списком `Сущность.Право.…` — не знаем, считаем
+    выданными; обработчика нет — считаем закрытым, как «не указано»."""
+    if type_module is None:
+        return False
+    for name, body in _text_bodies(type_module).items():
+        if name not in _PERMISSION_HANDLERS:
+            continue
+        for m in _PERMISSION_CALL.finditer(body):
+            arguments = _call_arguments(body, m.end() - 1)
+            if _OPEN_KEY.search(arguments) and (_CHANGE_RIGHT.search(arguments)
+                                                or not _ANY_RIGHT.search(arguments)):
+                return True
+    return False
+
+
+def _editable_by_others(yaml_text: str, type_module: str | None = None) -> bool:
     """Право изменения объекта указано и не ограничено администраторами: `Изменение`,
-    а без него — `ПоУмолчанию`. Не указано вовсе — не знаем, считаем закрытым."""
+    а без него — `ПоУмолчанию`. Не указано вовсе — не знаем, считаем закрытым. Права
+    вычисляются — решают обработчики расчёта разрешений модуля типа (`_computed_open`)."""
     rights = dict(_RIGHT_LINE.findall(yaml_text))
     value = rights.get("Изменение") or rights.get("Update") or rights.get("ПоУмолчанию") \
         or rights.get("Default")
+    if value in _COMPUTED:
+        return _computed_open(type_module)
     return value is not None and value not in _ADMINS_ONLY
 
 
@@ -1885,7 +1926,11 @@ def _object_module(source: SourceFile) -> tuple[str, str] | None:
                 described = (folder / (m.group(1) + ".yaml")).read_text(encoding="utf-8-sig")
             except OSError:
                 continue
-            return (m.group(1), text) if _editable_by_others(described) else None
+            try:
+                type_module = (folder / (m.group(1) + ".xbsl")).read_text(encoding="utf-8-sig")
+            except OSError:
+                type_module = None
+            return (m.group(1), text) if _editable_by_others(described, type_module) else None
     return None
 
 

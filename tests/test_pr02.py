@@ -190,10 +190,39 @@ OBJECT = """
 
 POST = POST_YAML.format(изменение="РазрешенияВычисляютсяДляКаждогоОбъекта")
 
+# Модуль типа: расчёт разрешений выдаёт изменение всем вошедшим — объект открыт
+POST_TYPE_OPEN = """
+    @Обработчик
+    метод ВычислитьРазрешенияДоступа(): ЧитаемаяКоллекция<РазрешениеДоступа>
+        возврат [новый РазрешениеДоступа([новый КлючДоступаДляАутентифицированных.Объект()],
+            [Сущность.Право.Чтение, Сущность.Право.Изменение])]
+    ;
+"""
+
+# Изменение — только своему ключу редакторов, всем вошедшим — чтение: объект закрыт
+POST_TYPE_OWN_KEY = """
+    @Обработчик
+    метод ВычислитьРазрешенияДоступа(): ЧитаемаяКоллекция<РазрешениеДоступа>
+        возврат [
+            новый РазрешениеДоступа([новый КлючРедакторов.Объект()], [Сущность.Право.Изменение]),
+            новый РазрешениеДоступа([новый КлючДоступаДляАутентифицированных.Объект()],
+                [Сущность.Право.Чтение])]
+    ;
+"""
+
+# Права переменной, а не списком: не знаем — считаем выданными
+POST_TYPE_RIGHTS_VARIABLE = """
+    @Обработчик
+    метод ВычислитьРазрешенияДоступа(): ЧитаемаяКоллекция<РазрешениеДоступа>
+        знч Права = ПраваПоНастройке()
+        возврат [новый РазрешениеДоступа([новый КлючДоступаДляВсех.Объект()], Права)]
+    ;
+"""
+
 
 def test_admin_field_without_check_in_object(tmp_path, monkeypatch, data_dir):
     rc, found = check(tmp_path, monkeypatch, data_dir, {
-        "ПостФорма.yaml": FORM_YAML, "Пост.Объект.xbsl": OBJECT.format(проверка=""), "Пост.yaml": POST,
+        "ПостФорма.yaml": FORM_YAML, "Пост.Объект.xbsl": OBJECT.format(проверка=""), "Пост.yaml": POST, "Пост.xbsl": POST_TYPE_OPEN,
         "Админ.xbsl": ADMIN})
     assert rc == 1
     assert [(f["rule"], f["line"]) for f in found] == [("ПР-02", 11)]
@@ -203,7 +232,7 @@ def test_admin_field_without_check_in_object(tmp_path, monkeypatch, data_dir):
 
 def test_admin_field_checked_in_object(tmp_path, monkeypatch, data_dir):
     rc, found = check(tmp_path, monkeypatch, data_dir, {
-        "ПостФорма.yaml": FORM_YAML, "Пост.yaml": POST,
+        "ПостФорма.yaml": FORM_YAML, "Пост.yaml": POST, "Пост.xbsl": POST_TYPE_OPEN,
         "Пост.Объект.xbsl": OBJECT.format(проверка="если Общая и не Админ.ЭтоАдминистратор()\n"
                                                     "            Общая = Ложь\n        ;"),
         "Админ.xbsl": ADMIN})
@@ -215,7 +244,7 @@ def test_agreed_finding(tmp_path, monkeypatch, data_dir):
         "IT/Проект/Основное/ПостФорма.yaml: ПР-02 Видимость ФлажокОбщая — модерация\n",
         encoding="utf-8")
     rc, found = check(tmp_path, monkeypatch, data_dir, {
-        "ПостФорма.yaml": FORM_YAML, "Пост.Объект.xbsl": OBJECT.format(проверка=""), "Пост.yaml": POST,
+        "ПостФорма.yaml": FORM_YAML, "Пост.Объект.xbsl": OBJECT.format(проверка=""), "Пост.yaml": POST, "Пост.xbsl": POST_TYPE_OPEN,
         "Админ.xbsl": ADMIN}, "--agreed", "согласовано.txt")
     assert rc == 0
     assert len(found) == 1
@@ -243,7 +272,7 @@ def test_admin_fields_reported_once_per_element(tmp_path, monkeypatch, data_dir)
                             Значение: =Объект.Код
 """)
     rc, found = check(tmp_path, monkeypatch, data_dir, {
-        "ПостФорма.yaml": form, "Пост.Объект.xbsl": OBJECT.format(проверка=""), "Пост.yaml": POST,
+        "ПостФорма.yaml": form, "Пост.Объект.xbsl": OBJECT.format(проверка=""), "Пост.yaml": POST, "Пост.xbsl": POST_TYPE_OPEN,
         "Админ.xbsl": ADMIN})
     assert rc == 1
     assert len(found) == 1
@@ -285,3 +314,21 @@ def test_privileged_without_write_is_not_a_finding(tmp_path, monkeypatch, data_d
         "СписокКоманд.xbsl": xbsl[:xbsl.index("    @НаСервере @ДоступноСКлиента")],
         "Команды.xbsl": commands, "Админ.xbsl": ADMIN})
     assert (rc, found) == (0, [])
+
+
+@pytest.mark.parametrize("type_module", [POST_TYPE_OWN_KEY, None])
+def test_computed_rights_without_open_key_is_not_a_finding(tmp_path, monkeypatch, data_dir, type_module):
+    files = {"ПостФорма.yaml": FORM_YAML, "Пост.Объект.xbsl": OBJECT.format(проверка=""), "Пост.yaml": POST,
+             "Админ.xbsl": ADMIN}
+    if type_module:
+        files["Пост.xbsl"] = type_module
+    rc, found = check(tmp_path, monkeypatch, data_dir, files)
+    assert (rc, found) == (0, [])
+
+
+def test_computed_rights_given_by_variable_are_open(tmp_path, monkeypatch, data_dir):
+    rc, found = check(tmp_path, monkeypatch, data_dir, {
+        "ПостФорма.yaml": FORM_YAML, "Пост.Объект.xbsl": OBJECT.format(проверка=""), "Пост.yaml": POST,
+        "Пост.xbsl": POST_TYPE_RIGHTS_VARIABLE, "Админ.xbsl": ADMIN})
+    assert rc == 1
+    assert [(f["rule"], f["line"]) for f in found] == [("ПР-02", 11)]

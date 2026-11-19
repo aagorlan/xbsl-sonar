@@ -16,7 +16,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from xbsl.diagnostics import Diagnostic, Severity
-from xbsl.engine import SourceFile, rule
+from xbsl.engine import SourceFile, load, rule
 from xbsl.rules._syntax import code_tokens, query_ranges
 
 
@@ -53,7 +53,9 @@ RULES: dict[str, RuleText] = {
             "записанный в данные, сверкой не считается.</p>"
             "<p><b>Не находка:</b> метод без параметров-ссылок (участник берётся на сервере); "
             "метод без привилегированного контекста — действуют права объекта; метод, "
-            "сверяющий ссылку с текущим пользователем или проверяющий администратора.</p>"
+            "сверяющий ссылку с текущим пользователем или проверяющий администратора; метод, "
+            "которому ссылка нужна только ради типа — она встречается лишь в "
+            "<code>Ссылка.ПолучитьТип()</code> и в сравнении с <code>Неопределено</code>.</p>"
             "<p><b>Как исправить:</b> брать текущего пользователя или участника на сервере, "
             "а не из параметра; если ссылка нужна — сверить её с текущим пользователем "
             "до открытия привилегированного контекста или не повышать права.</p>"
@@ -292,10 +294,14 @@ RULES: dict[str, RuleText] = {
             "(<code>ПроизвольнаяСтрокаСписка</code>) находка отмечается особо;</li>"
             "<li>в модуле компонента — обработчик (<code>@Обработчик</code>), в теле которого "
             "запросов и вызовов таких методов больше порога (параметр <code>--max-accesses</code>, "
-            "по умолчанию 3).</li>"
+            "по умолчанию 3) на одном пути исполнения: из ветвей <code>если</code>/<code>иначе</code> "
+            "и <code>выбор</code>/<code>когда</code> берётся наибольшая.</li>"
             "</ul><p><b>Не находка:</b> выражение без вызова метода (<code>=ДанныеСтроки.Данные.Текст</code>); "
             "<code>ЗначениеПоУмолчанию</code> свойства компонента — оно считается один раз, при создании; "
-            "метод, который считает на клиенте из уже полученных данных; обработчик с обращениями "
+            "метод, который считает на клиенте из уже полученных данных; клиентский метод модуля "
+            "компонента, который идёт на сервер только в ветви <code>если Свойство == Неопределено</code>, "
+            "где свойство объявлено в разделе <code>Свойства</code> компонента и модуль присваивает "
+            "ему значение; обработчик с обращениями "
             "не больше порога; находка из перечня согласованных (<code>--agreed</code>: строка "
             "<code>путь: ПР-17 Ключ — причина</code>).</p>"
             "<p><b>Как исправить:</b> получить данные один раз — в обработчике открытия или полем "
@@ -832,13 +838,16 @@ RULES: dict[str, RuleText] = {
             "запрос, кешировать их некому.</p>"
             "<p><b>Находка:</b> в модуле HTTP-сервиса (пара <code>.yaml</code> — "
             "<code>ВидЭлемента: HttpСервис</code>) метод ставит тело ответа "
-            "<code>.УстановитьТело(…)</code> строкой или JSON — строковым литералом, "
-            "интерполированной строкой, <code>СериализацияJson.…</code>, прямо или через "
+            "<code>.УстановитьТело(…)</code> строкой или JSON — интерполированной строкой, "
+            "<code>СериализацияJson.…</code>, прямо или через "
             "переменную метода, — а заголовок <code>Cache-Control</code> со значением, "
             "содержащим <code>no-store</code>, в этом же методе не ставит.</p>"
             "<p><b>Не находка:</b> <code>no-store</code> поставлен в том же методе — до тела "
             "или после; тело — файл, поток или двоичный объект (картинку и вложение кешировать "
-            "можно); запрос <code>КлиентHttp</code> — это не ответ; модуль не HTTP-сервиса.</p>"
+            "можно); тело из одних литералов — строка без интерполяции, литерал коллекции или "
+            "локальное соответствие, заполненное только литералами, и их сериализация в JSON "
+            "(одинаково для всех, чужого в нём нет); запрос <code>КлиентHttp</code> — это не ответ; "
+            "модуль не HTTP-сервиса.</p>"
             "<p><b>Как исправить:</b> рядом с телом — "
             "<code>Запрос.Ответ.Заголовки.Установить(\"Cache-Control\", \"no-store\")</code>; "
             "ответы с данными удобно собирать одним методом, который ставит и тип, и заголовок.</p>"
@@ -1113,6 +1122,33 @@ def _reference_params(toks: list, i: int) -> list[str]:
     return names
 
 
+def _header_end(toks: list, i: int) -> int:
+    """Смещение в тексте сразу за скобкой параметров метода (токен `метод` с индексом i)."""
+    depth = 0
+    for k in range(i + 2, len(toks)):
+        if toks[k].kind == "OP" and toks[k].value == "(":
+            depth += 1
+        elif toks[k].kind == "OP" and toks[k].value == ")":
+            depth -= 1
+            if depth == 0:
+                return toks[k].end
+    return toks[i].end
+
+
+_TYPE_USE_AFTER = re.compile(r"\s*(?:\.\s*(?:ПолучитьТип|GetType)\s*\(\s*\)|[!=]=\s*(?:Неопределено|Undefined)(?![\w]))")
+_TYPE_USE_BEFORE = re.compile(r"(?<![\w.])(?:Неопределено|Undefined)\s*[!=]=\s*$")
+
+
+def _type_only(body: str, param: str) -> bool:
+    """Параметр в теле метода (вместе с текстом запросов и строк) встречается только как
+    `П.ПолучитьТип()` и в сравнении с `Неопределено`: объект по ссылке не читается, нужен лишь
+    её тип. Любое другое упоминание — в запросе, в вызове, через точку — доступ по ссылке."""
+    for m in re.finditer(rf"(?<![\w.]){re.escape(param)}(?![\w])", body):
+        if not (_TYPE_USE_AFTER.match(body, m.end()) or _TYPE_USE_BEFORE.search(body[:m.start()])):
+            return False
+    return True
+
+
 @rule("ПР-01", "Объект по ссылке с клиента под повышенными правами", "S",
       severity=Severity.WARNING)
 def reference_from_client(source: SourceFile) -> Iterable[Diagnostic]:
@@ -1141,14 +1177,16 @@ def reference_from_client(source: SourceFile) -> Iterable[Diagnostic]:
                     ann = _annotations(toks, i - 1 if static else i)
                     params = _reference_params(toks, i)
                     if ann & _SERVER and ann & _FROM_CLIENT and params:
-                        method = [_method_name(toks, i), t.line, params, len(frames), False, False]
+                        method = [_method_name(toks, i), t.line, params, len(frames), False, False,
+                                  _header_end(toks, i)]
                     else:
                         method = None
         elif t.kind == "OP" and t.value == ";":
             if frames:
                 if method is not None and len(frames) == method[3]:
-                    name, line, params, _, privileged, checked = method
-                    if privileged and not checked:
+                    name, line, params, _, privileged, checked, body = method
+                    if privileged and not checked and not all(
+                            _type_only(source.text[body:t.start], p) for p in params):
                         out.append(Diagnostic(
                             source.rel, line, 1, "ПР-01", Severity.WARNING,
                             f"Метод '{name}' доступен с клиента, принимает ссылку "
@@ -1694,23 +1732,227 @@ def _pair_component(source: SourceFile) -> bool:
         return False
 
 
-def _accesses(toks: list, start: int, end: int, own: str, data_set: frozenset[str]) -> int:
-    """Запросы и вызовы методов, доходящих до сервера или базы, в токенах [start, end)."""
+def _access_at(toks: list, k: int, own: str, data_set: frozenset[str]) -> int:
+    """1, если токен k — литерал запроса или вызов метода, доходящего до сервера или базы."""
+    t = toks[k]
+    if t.kind == "KEYWORD" and t.canonical == "QUERY":
+        return 1
+    prev = toks[k - 1] if k > 0 else None
+    if (t.kind == "IDENT" and k + 1 < len(toks) and toks[k + 1].value == "("
+            and not (prev is not None and prev.kind == "KEYWORD" and prev.canonical == "METHOD")):
+        if prev is not None and prev.value in (".", "?."):
+            if k >= 2 and toks[k - 2].kind == "IDENT" and (k < 3 or toks[k - 3].value != "."):
+                return int(f"{toks[k - 2].value}.{t.value}" in data_set)
+            return 0
+        return int(f"{own}.{t.value}" in data_set)
+    return 0
+
+
+_CONDITION_GOES_ON = {"AND", "OR", "NOT"}
+
+
+def _condition_end(toks: list, k: int, end: int) -> int:
+    """Конец условия `если`/`иначе если`/`выбор`, начинающегося с токена k: первый токен на новой
+    строке вне скобок, если предыдущая строка не оборвана на операции или `и`/`или`/`не`
+    и новая не начинается с `и`/`или`."""
+    depth = 0
+    j = k
+    while j < end:
+        t = toks[j]
+        if j > k and depth == 0 and t.line > toks[j - 1].line:
+            last = toks[j - 1]
+            goes_on = ((last.kind == "KEYWORD" and last.canonical in _CONDITION_GOES_ON)
+                       or (last.kind == "OP" and last.value not in (")", "]", "}"))
+                       or (t.kind == "KEYWORD" and t.canonical in ("AND", "OR")))
+            if not goes_on:
+                return j
+        if t.kind == "OP" and t.value in "([{":
+            depth += 1
+        elif t.kind == "OP" and t.value in ")]}":
+            depth -= 1
+        j += 1
+    return j
+
+
+def _opener(t) -> bool:
+    return t.kind == "KEYWORD" and t.canonical in _OPENERS and t.value[:1].islower()
+
+
+def _path_accesses(toks: list, k: int, end: int, own: str, data_set: frozenset[str],
+                   stops: frozenset[str] = frozenset()) -> tuple[int, int]:
+    """Наибольшее число обращений на одном пути исполнения в токенах от k до `;` своего уровня,
+    до ключевого слова из `stops` или до end: (число, индекс остановки).
+
+    Ветви `если`/`иначе если`/`иначе` и `когда`/`иначе` у `выбор` взаимоисключающие — берётся
+    наибольшая, а условия, проверенные на пути к ней, добавляются; тела циклов и прочих блоков
+    считаются один раз, подряд."""
     count = 0
-    prev = None
-    for k in range(start, end):
+    while k < end:
         t = toks[k]
-        if t.kind == "KEYWORD" and t.canonical == "QUERY":
-            count += 1
-        elif (t.kind == "IDENT" and k + 1 < len(toks) and toks[k + 1].value == "("
-              and not (prev is not None and prev.kind == "KEYWORD" and prev.canonical == "METHOD")):
-            if prev is not None and prev.value in (".", "?."):
-                if k >= 2 and toks[k - 2].kind == "IDENT" and (k < 3 or toks[k - 3].value != "."):
-                    count += f"{toks[k - 2].value}.{t.value}" in data_set
-            else:
-                count += f"{own}.{t.value}" in data_set
-        prev = t
-    return count
+        if t.kind == "OP" and t.value == ";":
+            return count, k
+        if t.kind == "KEYWORD" and t.canonical in stops and t.value[:1].islower():
+            return count, k
+        if _opener(t) and t.canonical == "IF":
+            cond_end = _condition_end(toks, k + 1, end)
+            conditions = sum(_access_at(toks, j, own, data_set) for j in range(k + 1, cond_end))
+            paths = []
+            body, k = _path_accesses(toks, cond_end, end, own, data_set, frozenset({"ELSE"}))
+            paths.append(conditions + body)
+            otherwise = False
+            while k < end and toks[k].kind == "KEYWORD" and toks[k].canonical == "ELSE":
+                nxt = toks[k + 1] if k + 1 < end else None
+                if nxt is not None and nxt.kind == "KEYWORD" and nxt.canonical == "IF" \
+                        and nxt.line == toks[k].line:
+                    cond_end = _condition_end(toks, k + 2, end)
+                    conditions += sum(_access_at(toks, j, own, data_set) for j in range(k + 2, cond_end))
+                    body, k = _path_accesses(toks, cond_end, end, own, data_set, frozenset({"ELSE"}))
+                    paths.append(conditions + body)
+                else:
+                    otherwise = True
+                    body, k = _path_accesses(toks, k + 1, end, own, data_set)
+                    paths.append(conditions + body)
+            if not otherwise:
+                paths.append(conditions)
+            count += max(paths)
+            k += 1
+            continue
+        if _opener(t) and t.canonical == "CASE":
+            cond_end = _condition_end(toks, k + 1, end)
+            head = sum(_access_at(toks, j, own, data_set) for j in range(k + 1, cond_end))
+            paths = [0]
+            k = cond_end
+            while k < end and not (toks[k].kind == "OP" and toks[k].value == ";"):
+                if toks[k].kind == "KEYWORD" and toks[k].canonical in ("WHEN", "ELSE"):
+                    k += 1
+                body, k = _path_accesses(toks, k, end, own, data_set, frozenset({"WHEN", "ELSE"}))
+                paths.append(body)
+            count += head + max(paths)
+            k += 1
+            continue
+        if _opener(t):
+            body, k = _path_accesses(toks, k + 1, end, own, data_set)
+            count += body
+            k += 1
+            continue
+        count += _access_at(toks, k, own, data_set)
+        k += 1
+    return count, k
+
+
+_YAML_PROPERTIES = re.compile(r"^(?:Свойства|Properties):\s*$")
+_YAML_TOP = re.compile(r"^[^\s#-]")
+_UNDEFINED = {"Неопределено", "Undefined"}
+
+
+def _component_properties(yaml_text: str) -> set[str]:
+    """Имена свойств компонента из раздела `Свойства` его YAML."""
+    names: set[str] = set()
+    inside = False
+    for line in yaml_text.splitlines():
+        if _YAML_TOP.match(line):
+            inside = bool(_YAML_PROPERTIES.match(line))
+            continue
+        m = _YAML_NAME.match(line) if inside else None
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def _empty_check(toks: list, k: int, end: int) -> str | None:
+    """Имя X, если токены [k, end) — ровно `X == Неопределено` или `Неопределено == X`."""
+    if end - k != 3 or toks[k + 1].kind != "OP" or toks[k + 1].value != "==":
+        return None
+    a, b = toks[k], toks[k + 2]
+    if a.kind == "IDENT" and b.value in _UNDEFINED:
+        return a.value
+    if b.kind == "IDENT" and a.value in _UNDEFINED:
+        return b.value
+    return None
+
+
+def _lazy_spans(toks: list, start: int, end: int) -> list[tuple[int, int, str]]:
+    """Первые ветви `если X == Неопределено` в токенах [start, end): (начало, конец, X)."""
+    spans: list[tuple[int, int, str]] = []
+    frames: list[list] = []
+    k = start
+    while k < end:
+        t = toks[k]
+        if _opener(t):
+            is_else_if = (t.canonical == "IF" and k > 0 and toks[k - 1].kind == "KEYWORD"
+                          and toks[k - 1].canonical == "ELSE" and toks[k - 1].line == t.line)
+            if not is_else_if:
+                if t.canonical == "IF":
+                    cond_end = _condition_end(toks, k + 1, end)
+                    name = _empty_check(toks, k + 1, cond_end)
+                    frames.append([t.canonical, name, cond_end])
+                    k = cond_end
+                    continue
+                frames.append([t.canonical, None, k])
+        elif t.kind == "KEYWORD" and t.canonical == "ELSE" and frames:
+            if frames[-1][1] is not None:
+                spans.append((frames[-1][2], k, frames[-1][1]))
+                frames[-1][1] = None
+        elif t.kind == "OP" and t.value == ";" and frames:
+            _canonical, name, body = frames.pop()
+            if name is not None:
+                spans.append((body, k, name))
+        k += 1
+    return spans
+
+
+def _filled_lazily(module, method: str, properties: set[str], own: str,
+                   data_set: frozenset[str]) -> bool:
+    """Метод модуля компонента идёт на сервер или в базу только в первой ветви
+    `если X == Неопределено`, где X — свойство компонента, которому модуль где-нибудь присваивает
+    значение: после заполнения свойства перерисовка сервера не зовёт. Метод с `@НаСервере`
+    (каждый вызов — на сервере) и X, объявленный в методе локально, — не такой случай."""
+    toks = code_tokens(module)
+    bodies = _method_bodies(toks)
+    if method not in bodies:
+        return False
+    start, end = bodies[method]
+    static = start >= 1 and toks[start - 1].value in ("статический", "static")
+    head = start - 1 if static else start
+    lines = module.text.splitlines()
+    n = toks[head].line - 2
+    while n >= 0 and lines[n].lstrip().startswith("@"):
+        if re.search(r"@(?:НаСервере|OnServer)\b", lines[n]):
+            return False
+        n -= 1
+    spans = _lazy_spans(toks, start + 2, end)
+    accesses = [k for k in range(start + 2, end) if _access_at(toks, k, own, data_set)]
+    if not accesses or not spans:
+        return False
+    local = {toks[k + 1].value for k in range(start + 2, end - 1)
+             if toks[k].kind == "KEYWORD" and toks[k].canonical in ("VAL", "VAR")}
+    assigned = {m.group(1) for m in re.finditer(r"(?m)^\s*(\w+)\s*=(?!=)", module.text)}
+    cached = (properties & assigned) - local
+    return all(any(a <= k < b and name in cached for a, b, name in spans) for k in accesses)
+
+
+def _accesses(toks: list, start: int, end: int, own: str, data_set: frozenset[str]) -> int:
+    """Запросы и вызовы методов, доходящих до сервера или базы, в токенах [start, end) —
+    наибольшее число на одном пути исполнения (`_path_accesses`)."""
+    total = 0
+    k = start
+    while k < end:
+        count, k = _path_accesses(toks, k, end, own, data_set)
+        total += count
+        k += 1
+    return total
+
+
+def _lazy_component_method(source: SourceFile, name: str, own: str,
+                           data_set: frozenset[str]) -> bool:
+    """Метод выражения YAML компонента заполняет свойство лениво (`_filled_lazily`)."""
+    pair = source.path.with_name(own + ".xbsl")
+    if not pair.is_file():
+        return False
+    cache = source.cache.setdefault("pr17_module", {})
+    if "module" not in cache:
+        cache["module"] = load(pair)
+    return _filled_lazily(cache["module"], name, _component_properties(source.text), own, data_set)
 
 
 @rule("ПР-17", "Обращение к серверу при каждой перерисовке формы", "D", severity=Severity.WARNING)
@@ -1733,6 +1975,8 @@ def redraw_data_access(source: SourceFile) -> Iterable[Diagnostic]:
                 module, name = call.group(1), call.group(2)
                 key = f"{module or own}.{name}"
                 if key not in data_set:
+                    continue
+                if module in (None, own) and _lazy_component_method(source, name, own, data_set):
                     continue
                 where = ("строка списка считает его на каждую строку при каждой перерисовке"
                          if row else "форма считает его при каждой перерисовке")
@@ -1862,12 +2106,53 @@ _RIGHT_LINE = re.compile(r"^\s*(Изменение|ПоУмолчанию|Update
 _ADMINS_ONLY = {"РазрешеноАдминистраторам", "AllowedToAdministrators"}
 
 
-def _editable_by_others(yaml_text: str) -> bool:
+_COMPUTED = {"РазрешенияВычисляются", "РазрешенияВычисляютсяДляКаждогоОбъекта"}
+_PERMISSION_CALL = re.compile(r"(?<![\w.])РазрешениеДоступа\s*\(")
+_OPEN_KEY = re.compile(r"\bКлючДоступаДля(?:Всех|Аутентифицированных)\b")
+_CHANGE_RIGHT = re.compile(r"\bПраво\s*\.\s*(?:Изменение|Создание)\b")
+_ANY_RIGHT = re.compile(r"\bПраво\s*\.\s*\w+")
+_PERMISSION_HANDLERS = {"ВычислитьРазрешенияДоступа", "ВычислитьРазрешенияДоступаДляОбъектов"}
+
+
+def _call_arguments(text: str, start: int) -> str:
+    """Текст аргументов вызова от открывающей скобки на `start` до парной закрывающей."""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:i]
+    return text[start + 1:]
+
+
+def _computed_open(type_module: str | None) -> bool:
+    """Обработчики расчёта разрешений модуля типа выдают изменение или создание стандартному
+    ключу всех или всех вошедших. Права не списком `Сущность.Право.…` — не знаем, считаем
+    выданными; обработчика нет — считаем закрытым, как «не указано»."""
+    if type_module is None:
+        return False
+    for name, body in _text_bodies(type_module).items():
+        if name not in _PERMISSION_HANDLERS:
+            continue
+        for m in _PERMISSION_CALL.finditer(body):
+            arguments = _call_arguments(body, m.end() - 1)
+            if _OPEN_KEY.search(arguments) and (_CHANGE_RIGHT.search(arguments)
+                                                or not _ANY_RIGHT.search(arguments)):
+                return True
+    return False
+
+
+def _editable_by_others(yaml_text: str, type_module: str | None = None) -> bool:
     """Право изменения объекта указано и не ограничено администраторами: `Изменение`,
-    а без него — `ПоУмолчанию`. Не указано вовсе — не знаем, считаем закрытым."""
+    а без него — `ПоУмолчанию`. Не указано вовсе — не знаем, считаем закрытым. Права
+    вычисляются — решают обработчики расчёта разрешений модуля типа (`_computed_open`)."""
     rights = dict(_RIGHT_LINE.findall(yaml_text))
     value = rights.get("Изменение") or rights.get("Update") or rights.get("ПоУмолчанию") \
         or rights.get("Default")
+    if value in _COMPUTED:
+        return _computed_open(type_module)
     return value is not None and value not in _ADMINS_ONLY
 
 
@@ -1885,7 +2170,11 @@ def _object_module(source: SourceFile) -> tuple[str, str] | None:
                 described = (folder / (m.group(1) + ".yaml")).read_text(encoding="utf-8-sig")
             except OSError:
                 continue
-            return (m.group(1), text) if _editable_by_others(described) else None
+            try:
+                type_module = (folder / (m.group(1) + ".xbsl")).read_text(encoding="utf-8-sig")
+            except OSError:
+                type_module = None
+            return (m.group(1), text) if _editable_by_others(described, type_module) else None
     return None
 
 
@@ -3175,8 +3464,10 @@ _CONTINUES = re.compile(r"(?:[=+\-*/?:,(.]|\b(?:и|или|и\s+не|and|or))\s*$
 _CONTINUED = re.compile(r"^\s*(?:[?:+\-*/.)]|\b(?:и|или|and|or)\b)")
 
 
-def _statements(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
-    """Операторы тела: строки склеиваются, пока открыты скобки или строка явно продолжается."""
+def _statements(lines: list[tuple[int, str]], keep_literals: bool = False) -> list[tuple[int, str]]:
+    """Операторы тела: строки склеиваются, пока открыты скобки или строка явно продолжается.
+    Строковые литералы заменяются на `""`; с `keep_literals` остаются как есть (границы
+    операторов те же)."""
     out: list[tuple[int, str]] = []
     current: list[str] = []
     start = 0
@@ -3187,7 +3478,7 @@ def _statements(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
             continue
         if not current:
             start = n
-        current.append(code)
+        current.append(_code_part(line).rstrip() if keep_literals else code)
         depth += code.count("(") - code.count(")")
         nxt = lines[k + 1][1] if k + 1 < len(lines) else ""
         if depth > 0 or _CONTINUES.search(code) or _CONTINUED.match(_code_part(nxt)):
@@ -3443,13 +3734,86 @@ def http_without_timeout(source: SourceFile) -> Iterable[Diagnostic]:
 
 
 # ПР-26: ответ HTTP-сервиса с данными без `Cache-Control: no-store`. Только модули элементов
-# `ВидЭлемента: HttpСервис`. Данные — тело `.УстановитьТело(…)` из строкового литерала (в том
-# числе интерполированного) или `СериализацияJson.…`, прямо или через переменную метода; файл,
-# поток, двоичный объект — не данные. `no-store` засчитывается в том же методе, до тела или после:
+# `ВидЭлемента: HttpСервис`. Данные — тело `.УстановитьТело(…)` из строкового литерала с
+# интерполяцией или `СериализацияJson.…`, прямо или через переменную метода; файл, поток, двоичный
+# объект и тело из одних литералов (`_constant`) — не данные. `no-store` засчитывается в том же методе, до тела или после:
 # ответ уходит, когда обработчик закончился. Запрос `КлиентHttp` с телом — не ответ.
 _SET_BODY = re.compile(r"\.\s*(?:УстановитьТело|SetBody)\s*\(")
 _NO_STORE = re.compile(r"""["']Cache-Control["']\s*,\s*["'][^"']*no-store""", re.IGNORECASE)
 _DATA_BODY = re.compile(r'^\s*"|(?<![\w.])(?:СериализацияJson|JsonSerialization)\s*\.')
+# Тело из одних литералов данных не несёт: строка без выражений интерполяции, число, булево,
+# литерал коллекции из таких значений или `СериализацияJson.ЗаписатьОбъект(…)` от них — в том числе
+# от локального соответствия, созданного пустым и заполненного только литералами.
+_PLAIN_SCALAR = re.compile(r"^(?:-?\d+(?:\.\d+)?|Истина|Ложь|Неопределено|True|False|Undefined)$")
+_INTERPOLATION = re.compile(r"[%$](?:\{|[^\W\d])")
+_WRITE_JSON = re.compile(r"^(?:СериализацияJson|JsonSerialization)\s*\.\s*ЗаписатьОбъект\s*\((.*)\)$", re.S)
+_EMPTY_MAP = re.compile(r"^(?:новый|new)\s+(?:Соответствие|Map)\s*(?:<[^()]*>)?\s*\(\s*\)$")
+_DECLARE = re.compile(r"^\s*(?:знч|пер|val|var)\s+(\w+)(?:\s*:\s*[^=]+?)?\s*=(?!=)\s*(.+)$", re.S)
+_MAP_PUT = re.compile(r"^\s*(\w+)\s*(?:\[(.*)\]\s*=(?!=)\s*(.+)|\.\s*(?:Вставить|Insert)\s*\((.*)\))\s*$", re.S)
+
+
+def _plain_string(expr: str) -> bool:
+    """Строковый литерал целиком, без выражений интерполяции (`%имя`, `%{…}`, `$имя`, `${…}`)."""
+    if len(expr) < 2 or expr[0] != '"' or expr[-1] != '"':
+        return False
+    inner, i = expr[1:-1], 0
+    while i < len(inner):
+        if inner[i] == "\\":
+            i += 2
+            continue
+        if inner[i] == '"' or _INTERPOLATION.match(inner, i):
+            return False
+        i += 1
+    return True
+
+
+def _constant(expr: str, maps: set[str] = frozenset()) -> bool:
+    """Значение из одних литералов: строка без интерполяции, число, булево, `Неопределено`,
+    литерал массива, соответствия или множества из таких значений, их сериализация в JSON;
+    имя из `maps` — локальное соответствие из литералов."""
+    expr = expr.strip()
+    if _plain_string(expr) or _PLAIN_SCALAR.match(expr) or expr in maps:
+        return True
+    if len(expr) >= 2 and (expr[0], expr[-1]) in (("[", "]"), ("{", "}")):
+        inner = expr[1:-1]
+        if not inner.strip():
+            return True
+        for item in _top_split(inner, ","):
+            parts = _top_split(item, ":") if expr[0] == "{" else [item]
+            if len(parts) > 2 or not all(_constant(p) for p in parts):
+                return False
+        return True
+    m = _WRITE_JSON.match(expr)
+    return bool(m) and len(_top_split(m.group(1), ",")) == 1 and _constant(m.group(1), maps)
+
+
+def _literal_maps(statements: list[tuple[int, str]]) -> set[str]:
+    """Локальные соответствия метода, созданные пустыми или литералом и заполняемые только
+    литералами; любое другое упоминание имени (передача в вызов, переприсваивание) — кроме
+    сериализации в тело — снимает признак."""
+    maps: set[str] = set()
+    spoiled: set[str] = set()
+    for _n, stmt in statements:
+        d = _DECLARE.match(stmt)
+        if d and (_EMPTY_MAP.match(d.group(2).strip()) or (
+                d.group(2).strip().startswith("{") and _constant(d.group(2)))):
+            if d.group(1) in maps:
+                spoiled.add(d.group(1))
+            maps.add(d.group(1))
+            continue
+        p = _MAP_PUT.match(stmt)
+        if p and p.group(1) in maps:
+            values = [p.group(2), p.group(3)] if p.group(4) is None else _top_split(p.group(4), ",")
+            if len(values) != 2 or not all(_constant(v) for v in values):
+                spoiled.add(p.group(1))
+            continue
+        for name in maps:
+            for m in re.finditer(rf"(?<![\w.]){re.escape(name)}(?![\w])", stmt):
+                if not re.search(
+                        rf"(?:СериализацияJson|JsonSerialization)\s*\.\s*ЗаписатьОбъект\s*\(\s*$",
+                        stmt[:m.start()]) or not re.match(r"\s*\)", stmt[m.end():]):
+                    spoiled.add(name)
+    return maps - spoiled
 
 
 @rule("ПР-26", "Ответ HTTP-сервиса с данными без Cache-Control: no-store", "S",
@@ -3465,16 +3829,23 @@ def http_response_without_no_store(source: SourceFile) -> Iterable[Diagnostic]:
         if any(_NO_STORE.search(_code_part(text)) for text in body):
             continue
         first = line + header.count("\n") + 1
+        numbered = [(first + k, text) for k, text in enumerate(body)]
+        raw = _statements(numbered, keep_literals=True)
+        maps = _literal_maps(raw)
         data_vars: set[str] = set()
-        for n, stmt in _statements([(first + k, text) for k, text in enumerate(body)]):
+        for (n, stmt), (_n, raw_stmt) in zip(_statements(numbered), raw):
             a = _HTTP_ASSIGN.match(stmt)
             if a and not _SET_BODY.search(stmt):
-                if _DATA_BODY.search(a.group(2)):
+                ra = _HTTP_ASSIGN.match(raw_stmt)
+                if _DATA_BODY.search(a.group(2)) and not (ra and _constant(ra.group(2), maps)):
                     data_vars.add(a.group(1))
                 else:
                     data_vars.discard(a.group(1))
             m = _SET_BODY.search(stmt)
             if not m or _HTTP_CLIENT.search(stmt):
+                continue
+            rm = _SET_BODY.search(raw_stmt)
+            if rm and _constant(",".join(_call_args(raw_stmt, rm.end() - 1)), maps):
                 continue
             arg = ",".join(_call_args(stmt, m.end() - 1))
             if not (_DATA_BODY.search(arg) or any(

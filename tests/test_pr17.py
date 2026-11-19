@@ -215,3 +215,106 @@ def test_agreed_finding(tmp_path, monkeypatch, data_dir):
         "--agreed", "согласовано.txt")
     assert rc == 0
     assert [f["debt"] for f in found] == ["согласовано"]
+
+
+BRANCHES = """
+    @Обработчик
+    метод ПриОткрытии()
+        Режим = Данные()
+        если Признак
+            Первое = Данные()
+        иначе если Данные() == ""
+            Второе = Данные()
+        иначе
+            Третье = Данные()
+            {ещё}
+        ;
+        выбор Вид
+        когда 1
+            Четвёртое = Данные()
+        иначе
+            Пятое = Данные()
+        ;
+    ;
+
+    @НаСервере @ДоступноСКлиента
+    статический метод Данные(): Строка
+        возврат ""
+    ;
+"""
+
+
+def test_handler_counts_one_path_of_exclusive_branches(tmp_path, monkeypatch, data_dir):
+    # на любом пути: Режим, одна ветвь `если` с проверенными до неё условиями, одна ветвь `выбор`
+    rc, found = check(tmp_path, monkeypatch, data_dir, {
+        "Форма.yaml": COMPONENT_YAML, "Форма.xbsl": BRANCHES.format(ещё="")},
+        "--max-accesses", "4")
+    assert (rc, found) == (0, [])
+
+
+def test_handler_path_over_threshold_is_a_finding(tmp_path, monkeypatch, data_dir):
+    rc, found = check(tmp_path, monkeypatch, data_dir, {
+        "Форма.yaml": COMPONENT_YAML, "Форма.xbsl": BRANCHES.format(ещё="Шестое = Данные()")},
+        "--max-accesses", "4")
+    assert rc == 1
+    assert [(f["rule"], f["line"]) for f in found] == [("ПР-17", 2)]
+    assert found[0]["message"].startswith("Обработчик ПриОткрытии: 5 обращений")
+
+
+LAZY_YAML = """
+    ВидЭлемента: КомпонентИнтерфейса
+    Имя: Форма
+    Наследует:
+        Тип: ФормаОбъекта<Документ.Объект>
+        Содержимое:
+            Тип: Надпись
+            Видимость: =Разрешено()
+    Свойства:
+        -
+            Имя: Признак
+            Тип: Булево?
+"""
+
+LAZY_XBSL = """
+    @Обработчик
+    метод ПослеСоздания()
+        Признак = Разрешено()
+    ;
+
+    {аннотация}
+    метод Разрешено(): Булево
+        если {условие}
+            возврат Состояния.Цвет("") == Цвета.Зеленый
+        ;
+        возврат Признак
+    ;
+"""
+
+
+def test_property_filled_lazily_is_not_a_finding(tmp_path, monkeypatch, data_dir):
+    # сервер — только пока свойство компонента не заполнено, а заполняет его модуль
+    rc, found = check(tmp_path, monkeypatch, data_dir, {
+        "Форма.yaml": LAZY_YAML, "Состояния.xbsl": SERVER_STATES,
+        "Форма.xbsl": LAZY_XBSL.format(аннотация="", условие="Признак == Неопределено")})
+    assert (rc, found) == (0, [])
+
+
+@pytest.mark.parametrize("аннотация, условие", [
+    ("@НаСервере @ДоступноСКлиента", "Признак == Неопределено"),   # каждый вызов — на сервере
+    ("", "Объект.Ссылка != Неопределено"),                         # условие про данные, не про кеш
+    ("", "Другое == Неопределено"),                                # не свойство компонента
+])
+def test_server_on_every_redraw_is_still_a_finding(tmp_path, monkeypatch, data_dir, аннотация, условие):
+    rc, found = check(tmp_path, monkeypatch, data_dir, {
+        "Форма.yaml": LAZY_YAML, "Состояния.xbsl": SERVER_STATES,
+        "Форма.xbsl": LAZY_XBSL.format(аннотация=аннотация, условие=условие)})
+    assert rc == 1
+    assert [(f["rule"], f["line"]) for f in found] == [("ПР-17", 7)]
+
+
+def test_property_never_filled_is_still_a_finding(tmp_path, monkeypatch, data_dir):
+    module = LAZY_XBSL.format(аннотация="", условие="Признак == Неопределено").replace(
+        "Признак = Разрешено()", "Надпись = Разрешено()")
+    rc, found = check(tmp_path, monkeypatch, data_dir, {
+        "Форма.yaml": LAZY_YAML, "Состояния.xbsl": SERVER_STATES, "Форма.xbsl": module})
+    assert [(f["rule"], f["line"]) for f in found] == [("ПР-17", 7)]

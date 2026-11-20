@@ -2,10 +2,10 @@
 
 Движку нужен корень данных `<корень>/index.json` и `<корень>/<версия>/language.json`
 (ключевые слова и операторы). Его автор извлекает их из дистрибутива; дистрибутива у нас нет,
-а справка охраняется правом 1С, поэтому данные не хранятся в этом репозитории, а строятся
-при запуске из выгрузки справки потребителя: таблица ключевых слов из
-`topics/keywords/index.md` плюс слова, которых в таблице нет, но которые разбор требует.
-Операторы — знаки языка, справка их таблицей не перечисляет.
+поэтому корень строится при запуске: ключевые слова — из встроенного перечня `keywords.py`
+или, если передана выгрузка справки, из её таблицы `topics/keywords/index.md`; плюс слова,
+которых в таблице нет, но которые разбор требует. Операторы — знаки языка, справка их
+таблицей не перечисляет.
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
+from .keywords import KEYWORDS
 
 VERSION = "9.2"
 
@@ -42,17 +44,27 @@ OPERATORS = [
 _ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|")
 
 
-def keywords_from_help(index_md: Path) -> dict[str, dict]:
-    keywords: dict[str, dict] = {}
+def pairs_from_help(index_md: Path) -> list[tuple[str, str]]:
+    """Пары «русское — английское» из таблицы ключевых слов справки."""
+    pairs = []
     for line in index_md.read_text(encoding="utf-8").splitlines():
         m = _ROW.match(line.strip())
-        if not m:
-            continue
-        ru, en = m.group(1), m.group(2)
+        if m:
+            pairs.append((m.group(1), m.group(2)))
+    if not pairs:
+        raise SystemExit(f"В {index_md} не найдена таблица ключевых слов")
+    return pairs
+
+
+def keywords_from_help(index_md: Path) -> dict[str, dict]:
+    return keywords_from_pairs(pairs_from_help(index_md))
+
+
+def keywords_from_pairs(pairs) -> dict[str, dict]:
+    keywords: dict[str, dict] = {}
+    for ru, en in pairs:
         canon = _CANONICAL.get(en, en.upper())
         keywords[canon] = {"forms": [ru, en], "rules": [f"RULE_{canon}_KW"]}
-    if not keywords:
-        raise SystemExit(f"В {index_md} не найдена таблица ключевых слов")
     for canon, forms in _EXTRA.items():
         keywords.setdefault(canon, {"forms": [], "rules": [f"RULE_{canon}_KW"]})
         for f in forms:
@@ -61,17 +73,23 @@ def keywords_from_help(index_md: Path) -> dict[str, dict]:
     return dict(sorted(keywords.items()))
 
 
-def build(help_dir: Path, out: Path) -> Path:
-    """Собрать корень данных `out` из выгрузки справки `help_dir` (каталог `docs/vendor`)."""
-    index_md = help_dir / "topics" / "keywords" / "index.md"
-    if not index_md.is_file():
-        raise SystemExit(f"Нет таблицы ключевых слов справки: {index_md}")
-    keywords = keywords_from_help(index_md)
+def build(help_dir: Path | None, out: Path) -> Path:
+    """Собрать корень данных `out`: из встроенного перечня или, если задана, из выгрузки
+    справки `help_dir` (каталог с `topics/`)."""
+    if help_dir is None:
+        keywords = keywords_from_pairs(KEYWORDS)
+        source = "xbsl-sonar: встроенный перечень"
+    else:
+        index_md = help_dir / "topics" / "keywords" / "index.md"
+        if not index_md.is_file():
+            raise SystemExit(f"Нет таблицы ключевых слов справки: {index_md}")
+        keywords = keywords_from_help(index_md)
+        source = "xbsl-sonar: справка topics/keywords"
     ops = sorted(set(OPERATORS), key=lambda s: (-len(s), s))
     language = {
         "meta": {
             "element_version": VERSION,
-            "generated_from": "xbsl-sonar: справка topics/keywords",
+            "generated_from": source,
             "keyword_groups": len(keywords),
             "keyword_forms": sum(len(v["forms"]) for v in keywords.values()),
             "operators": len(ops),

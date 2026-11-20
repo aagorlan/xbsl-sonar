@@ -73,10 +73,12 @@
 ## Данные о языке
 
 Движку нужны ключевые слова XBSL. Их автор извлекает из дистрибутива платформы;
-здесь они строятся при каждом запуске из **выгрузки справки 1С:Элемент**, которая лежит
-у вас в проекте (`--help-dir`, каталог с `topics/`; нужна страница
-`topics/keywords/index.md`). Ни справка, ни данные из неё в этом репозитории не хранятся:
-справка охраняется правом 1С.
+здесь они **встроены** — перечень слов языка в `xbsl_sonar/keywords.py`, — и ничего,
+кроме кода проекта, для запуска не нужно. Текста справки в репозитории нет.
+
+Если платформа добавила ключевое слово раньше, чем вышла новая версия xbsl-sonar,
+передайте выгрузку справки 1С:Элемент из своего проекта: `--help-dir <каталог с topics/>`
+(нужна страница `topics/keywords/index.md`) — таблица прочитается из неё.
 
 ## Самостоятельный запуск (без SonarQube)
 
@@ -84,10 +86,9 @@
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install "xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@v0.30.0"
+.venv/bin/pip install "xbsl-sonar @ git+https://github.com/aagorlan/xbsl-sonar@v0.31.0"
 
-.venv/bin/xbsl-sonar check <каталог проекта> --help-dir <выгрузка справки> \
-    --json находки.json
+.venv/bin/xbsl-sonar check <каталог проекта> --json находки.json
 ```
 
 Что получается:
@@ -100,7 +101,9 @@ python3 -m venv .venv
 Полезное:
 
 - `--rules ПР-01,ПР-15` — только перечисленные правила;
-- `xbsl-sonar data --help-dir <справка> --out <каталог>` — собрать данные о языке один раз
+- `--help-dir <справка>` — ключевые слова из выгрузки справки, а не встроенные
+  (см. «Данные о языке»);
+- `xbsl-sonar data --out <каталог>` — собрать данные о языке один раз
   и дальше запускать `check --data-dir <каталог>`.
 
 ### Периметр (ПР-03)
@@ -125,7 +128,7 @@ IT/Проект/Обмен/Сервис.yaml: Вызов — приём сооб
 только проект — поэтому эта часть ПР-07 настраивается:
 
 ```sh
-xbsl-sonar check IT --help-dir docs/vendor \
+xbsl-sonar check IT \
     --pd-entities УчастникиПерсДанные \
     --pd-journal ЖурналДоступаПДн.ЗафиксироватьДоступПДн \
     --incident-sinks ОбращениеВПоддержку.ЗарегистрироватьОшибку
@@ -185,11 +188,10 @@ on:
   workflow_dispatch:
 jobs:
   analysis:
-    uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.30.0
+    uses: aagorlan/xbsl-sonar/.github/workflows/analysis.yml@v0.31.0
     with:
-      version: v0.30.0
+      version: v0.31.0
       paths: src
-      help-dir: docs/vendor
       perimeter: docs/периметр.txt         # перечень для ПР-03; можно не задавать
       pd-entities: УчастникиПерсДанные     # для ПР-07; можно не задавать
       pd-journal: ЖурналДоступаПДн.ЗафиксироватьДоступПДн
@@ -221,7 +223,7 @@ sonar.bsl.file.suffixes=.xbsl
 Затем:
 
 ```sh
-xbsl-sonar check <каталог проекта> --help-dir <справка> --bsl-report .xbsl-sonar/bsl-report.json
+xbsl-sonar check <каталог проекта> --bsl-report .xbsl-sonar/bsl-report.json
 sonar-scanner \
   -Dsonar.host.url=<адрес SonarQube> \
   -Dsonar.token=<токен анализа> \

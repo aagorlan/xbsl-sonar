@@ -1,12 +1,12 @@
 """Командная строка xbsl-sonar.
 
-    xbsl-sonar check IT --help-dir docs/vendor [--perimeter периметр.txt] [--sanitizers очистить]
+    xbsl-sonar check IT [--help-dir docs/vendor] [--perimeter периметр.txt] [--sanitizers очистить]
                     [--agreed согласовано.txt] [--min-period 60] [--max-accesses 3]
                     [--pd-entities Сущность,…] [--pd-journal Модуль.Метод,…]
                     [--incident-sinks Модуль.Метод,…]
                     [--bsl-report отчёт.json]
                     [--json находки.json]
-    xbsl-sonar data --help-dir docs/vendor --out каталог
+    xbsl-sonar data [--help-dir docs/vendor] --out каталог
     xbsl-sonar rules-file --out universal.json
 
 `check` возвращает 1, если есть находка без пометки исключения, 2 — при ошибке запуска.
@@ -580,7 +580,8 @@ def _check(args) -> int:
               file=sys.stderr)
         return 2
     with tempfile.TemporaryDirectory() as tmp:
-        data_dir = Path(args.data_dir) if args.data_dir else data.build(Path(args.help_dir), Path(tmp))
+        data_dir = Path(args.data_dir) if args.data_dir else data.build(
+            Path(args.help_dir) if args.help_dir else None, Path(tmp))
         server_file = Path(tmp) / "server.txt"
         server_file.write_text("\n".join(sorted(server_methods(args.paths))), encoding="utf-8")
         data_file = Path(tmp) / "data.txt"
@@ -636,7 +637,7 @@ def _check(args) -> int:
 
 
 def _data(args) -> int:
-    out = data.build(Path(args.help_dir), Path(args.out))
+    out = data.build(Path(args.help_dir) if args.help_dir else None, Path(args.out))
     print(f"Данные о языке: {out}")
     return 0
 
@@ -654,8 +655,9 @@ def main(argv: list[str] | None = None) -> int:
 
     c = sub.add_parser("check", help="проверить код")
     c.add_argument("paths", nargs="+", help="каталоги или файлы проекта")
-    src = c.add_mutually_exclusive_group(required=True)
-    src.add_argument("--help-dir", help="выгрузка справки 1С:Элемент (каталог с topics/)")
+    src = c.add_mutually_exclusive_group()
+    src.add_argument("--help-dir", help="выгрузка справки 1С:Элемент (каталог с topics/); "
+                                        "без неё — встроенный перечень ключевых слов")
     src.add_argument("--data-dir", help="готовые данные о языке (xbsl-sonar data)")
     c.add_argument("--rules", help="правила через запятую; по умолчанию все")
     c.add_argument("--perimeter", help="перечень периметра для ПР-03: строки «путь: Ключ — причина»")
@@ -677,7 +679,7 @@ def main(argv: list[str] | None = None) -> int:
     c.set_defaults(func=_check)
 
     d = sub.add_parser("data", help="собрать данные о языке из выгрузки справки")
-    d.add_argument("--help-dir", required=True)
+    d.add_argument("--help-dir", help="выгрузка справки; без неё — встроенный перечень ключевых слов")
     d.add_argument("--out", required=True)
     d.set_defaults(func=_data)
 

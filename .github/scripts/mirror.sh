@@ -43,7 +43,7 @@ read_releases() {
     page=$((page+1))
   done
 }
-normalize() { jq -s 'add | map({tagName,title,description:(.description//""),preRelease:(.preRelease//false)}) | sort_by(.tagName)'; }
+normalize() { jq -sc 'add | map({tagName,title,description:(.description//""),preRelease:(.preRelease//false)}) | sort_by(.tagName)'; }
 read_releases | normalize > "$tmp/current"
 jq -c --slurpfile old "$tmp/current" '.[] | select(.tagName as $tag | all($old[0][]; .tagName!=$tag)) | . + {attachProjectArchive:false}' "$tmp/expected" > "$tmp/missing"
 while IFS= read -r release; do

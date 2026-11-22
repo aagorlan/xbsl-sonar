@@ -1,0 +1,32 @@
+name: Зеркало GitFlic
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [Выпуск]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: gitflic-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Сверить ветку, метки и выпуски
+        env:
+          GITFLIC_REPO: ${{ vars.GITFLIC_REPO }}
+          GITFLIC_LOGIN: ${{ secrets.GITFLIC_LOGIN }}
+          GITFLIC_TOKEN: ${{ secrets.GITFLIC_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/mirror.sh

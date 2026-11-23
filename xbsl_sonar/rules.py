@@ -1202,14 +1202,14 @@ def reference_from_client(source: SourceFile) -> Iterable[Diagnostic]:
                 method[4] = True
             elif t.value in _RIGHT_CHECK and not method[4]:
                 method[5] = True
-            elif t.value in _CURRENT_USER and t.line == condition:
+            elif t.value in _CURRENT_USER and t.line == condition and not method[4]:
                 method[5] = True
             elif i + 1 < len(toks) and toks[i + 1].value == "(" and not (
                     prev is not None and prev.kind == "KEYWORD" and prev.canonical == "METHOD"):
                 qualified = (prev is not None and prev.value == "." and i >= 2
                              and toks[i - 2].kind == "IDENT")
                 module = toks[i - 2].value if qualified else own
-                if f"{module}.{t.value}" in identity:
+                if not method[4] and f"{module}.{t.value}" in identity:
                     method[5] = True
         prev = t
     return out

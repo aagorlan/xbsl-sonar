@@ -51,16 +51,17 @@ def identity_methods(paths: list[str]) -> set[str]:
     """Методы, которые сверяют с текущим пользователем (для ПР-01), — `Модуль.Метод`.
 
     Такой метод читает `ТекущийПользователь` или вызывает другой такой метод — набор
-    замыкается по вызовам: `ПроверитьПрава()`, зовущий `ЭтоАдминистратор()`, тоже сверка.
+    замыкается по вызовам без привязки к именам прикладных методов.
+    Определения одного метода из разных файлов считаются неоднозначными.
     Модуль — имя элемента (файл `Модуль.xbsl`, `Модуль.Объект.xbsl`); вызов без модуля
     относится к своему. Разбор по строкам: тело метода — от заголовка до следующего.
     """
-    bodies, _ = _bodies(paths)
+    bodies, _ = _bodies(paths, unique_methods=True)
     found = {key for key, lines in bodies.items() if _CURRENT_USER.search("\n".join(lines))}
     return _closure(found, bodies)
 
 
-def _bodies(paths: list[str]) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
+def _bodies(paths: list[str], *, unique_methods: bool = False) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
     """Тела методов по строкам и их аннотации: `Модуль.Метод` → строки тела, аннотации.
 
     Модуль — имя элемента (файл `Модуль.xbsl`, `Модуль.Объект.xbsl`); аннотации — строки
@@ -69,6 +70,7 @@ def _bodies(paths: list[str]) -> tuple[dict[str, list[str]], dict[str, set[str]]
     bodies: dict[str, list[str]] = {}
     annotations: dict[str, set[str]] = {}
     files: list[Path] = []
+    definitions: dict[str, set[Path]] = {}
     for p in map(Path, paths):
         files.extend(sorted(p.rglob("*.xbsl")) if p.is_dir() else [p])
     for file in files:
@@ -80,12 +82,18 @@ def _bodies(paths: list[str]) -> tuple[dict[str, list[str]], dict[str, set[str]]
             if m:
                 current = f"{module}.{m.group(1)}"
                 bodies.setdefault(current, [])
+                if unique_methods:
+                    definitions.setdefault(current, set()).add(file.resolve())
                 annotations[current] = pending
                 pending = set()
             elif line.lstrip().startswith("@"):
                 pending |= set(_ANNOTATION.findall(line))
             elif current:
                 bodies[current].append(line)
+    for key, locations in definitions.items():
+        if len(locations) > 1:
+            del bodies[key]
+            del annotations[key]
     return bodies, annotations
 
 

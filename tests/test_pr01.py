@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import textwrap
 from pathlib import Path
 
@@ -18,14 +19,15 @@ def data_dir(tmp_path_factory) -> Path:
     return data.build(HELP, tmp_path_factory.mktemp("data"))
 
 
-def check(tmp_path, monkeypatch, data_dir, code: str, other: str = "") -> list[tuple[str, int]]:
-    module = tmp_path / "IT" / "Проект" / "Основное" / "Модуль.xbsl"
-    module.parent.mkdir(parents=True)
+def check(tmp_path, monkeypatch, data_dir, code: str, other: str = "", *, layout: str = "modules") -> list[tuple[str, int]]:
+    source = tmp_path / layout
+    module = source / "Карточка.xbsl"
+    module.parent.mkdir(parents=True, exist_ok=True)
     module.write_text(textwrap.dedent(code).lstrip(), encoding="utf-8")
     if other:
         (module.parent / "ОбщийМодуль.xbsl").write_text(textwrap.dedent(other).lstrip(), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    cli.main(["check", "IT", "--data-dir", str(data_dir), "--rules", "ПР-01", "--json", "находки.json"])
+    cli.main(["check", str(source), "--data-dir", str(data_dir), "--rules", "ПР-01", "--json", "находки.json"])
     found = json.loads((tmp_path / "находки.json").read_text(encoding="utf-8"))["findings"]
     return [(f["rule"], f["line"]) for f in found]
 
@@ -46,7 +48,8 @@ COMMON = """
 """
 
 
-def test_reference_from_client_under_privilege(tmp_path, monkeypatch, data_dir):
+@pytest.mark.parametrize("layout", [".", "src", "компоненты/модули"])
+def test_reference_from_client_under_privilege(tmp_path, monkeypatch, data_dir, layout):
     assert check(tmp_path, monkeypatch, data_dir, """
         @ВПроекте
         @НаСервере @ДоступноСКлиента
@@ -57,7 +60,7 @@ def test_reference_from_client_under_privilege(tmp_path, monkeypatch, data_dir):
             исп КонтекстДоступа.Привилегированный()
             Журнал.Записать(НоваяЗапись)
         ;
-    """) == [("ПР-01", 3)]
+    """, layout=layout) == [("ПР-01", 3)]
 
 
 def test_nullable_reference_param(tmp_path, monkeypatch, data_dir):
@@ -219,3 +222,51 @@ def test_reference_passed_to_call_or_read_is_a_finding(tmp_path, monkeypatch, da
             возврат Основание.ЗагрузитьОбъект().Автор.Представление()
         ;
     """) == [("ПР-01", 2), ("ПР-01", 8)]
+
+def test_late_identity_check_does_not_suppress_diagnostic(tmp_path, monkeypatch, data_dir):
+    assert check(tmp_path, monkeypatch, data_dir, """
+        @НаСервере @ДоступноСКлиента
+        метод Описание(Элемент: Элементы.Ссылка): Строка
+            исп КонтекстДоступа.Привилегированный()
+            знч Текущий = ОбщийМодуль.ПолучитьУчастника()
+            возврат Элемент.Представление()
+        ;
+    """, COMMON) == [("ПР-01", 2)]
+
+
+def test_ambiguous_method_does_not_suppress_diagnostic(tmp_path, monkeypatch, data_dir):
+    other = tmp_path / "modules" / "другая-библиотека"
+    other.mkdir(parents=True)
+    (other / "ОбщийМодуль.xbsl").write_text(textwrap.dedent(COMMON), encoding="utf-8")
+    assert check(tmp_path, monkeypatch, data_dir, """
+        @НаСервере @ДоступноСКлиента
+        метод Описание(Элемент: Элементы.Ссылка): Строка
+            ОбщийМодуль.ПолучитьУчастника()
+            исп КонтекстДоступа.Привилегированный()
+            возврат Элемент.Представление()
+        ;
+    """, """
+        метод ПолучитьУчастника()
+        ;
+    """) == [("ПР-01", 2)]
+
+@pytest.mark.parametrize(("package", "expected"), [
+    ("DemoCRM", set()),
+    ("Форум", set()),
+    ("РассылкиИУведомления", {
+        "ИзменитьОтказ", "Подписчики", "Подписан", "ПодписчикиПоОснованию",
+    }),
+    ("СборИдейИПожеланий", {"ПредставлениеПользователя"}),
+])
+def test_vendor_package_matches_manual_review(tmp_path, monkeypatch, data_dir, package, expected):
+    vendor = os.environ.get("XBSL_VENDOR_DEMO")
+    if not vendor:
+        pytest.skip("Укажите XBSL_VENDOR_DEMO для сверки с исходниками вендора")
+    source = Path(vendor).resolve() / package
+    assert source.is_dir()
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "vendor.json"
+    cli.main(["check", str(source), "--data-dir", str(data_dir), "--rules", "ПР-01", "--json", str(output)])
+    findings = json.loads(output.read_text(encoding="utf-8"))["findings"]
+    methods = [finding["message"].split("'")[1] for finding in findings]
+    assert sorted(methods) == sorted(expected)

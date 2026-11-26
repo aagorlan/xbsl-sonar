@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import textwrap
 from pathlib import Path
 
@@ -21,11 +22,11 @@ def data_dir(tmp_path_factory) -> Path:
 def check(tmp_path, monkeypatch, data_dir, files: dict[str, str],
           *extra: str) -> tuple[int, list[dict]]:
     for name, code in files.items():
-        path = tmp_path / "IT" / "Проект" / "Основное" / name
+        path = tmp_path / "компоненты" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(code).lstrip(), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    rc = cli.main(["check", "IT", "--data-dir", str(data_dir), "--rules", "ПР-02",
+    rc = cli.main(["check", "компоненты", "--data-dir", str(data_dir), "--rules", "ПР-02",
                    "--json", "находки.json", *extra])
     found = json.loads((tmp_path / "находки.json").read_text(encoding="utf-8"))["findings"]
     return rc, found
@@ -108,7 +109,7 @@ def test_admin_button_reaches_unchecked_writer(tmp_path, monkeypatch, data_dir):
     assert rc == 1
     assert [(f["rule"], f["line"]) for f in found] == [("ПР-02", 16)]
     message = found[0]["message"]
-    assert message.startswith("Видимость ГруппаКоманд: элемент виден только администратору")
+    assert message.startswith("Видимость ГруппаКоманд: интерфейс ограничивает доступ к элементу")
     assert "'СписокКоманд.УдалитьНаСервере'" in message
 
 
@@ -227,7 +228,7 @@ def test_admin_field_without_check_in_object(tmp_path, monkeypatch, data_dir):
     assert rc == 1
     assert [(f["rule"], f["line"]) for f in found] == [("ПР-02", 11)]
     assert found[0]["message"].startswith(
-        "Видимость ФлажокОбщая: поле Общая видно только администратору, а 'Пост.ПередЗаписью'")
+        "Видимость ФлажокОбщая: поле Общая ограничено в интерфейсе, а 'Пост.ПередЗаписью'")
 
 
 def test_admin_field_checked_in_object(tmp_path, monkeypatch, data_dir):
@@ -241,7 +242,7 @@ def test_admin_field_checked_in_object(tmp_path, monkeypatch, data_dir):
 
 def test_agreed_finding(tmp_path, monkeypatch, data_dir):
     (tmp_path / "согласовано.txt").write_text(
-        "IT/Проект/Основное/ПостФорма.yaml: ПР-02 Видимость ФлажокОбщая — модерация\n",
+        "компоненты/ПостФорма.yaml: ПР-02 Видимость ФлажокОбщая — модерация\n",
         encoding="utf-8")
     rc, found = check(tmp_path, monkeypatch, data_dir, {
         "ПостФорма.yaml": FORM_YAML, "Пост.Объект.xbsl": OBJECT.format(проверка=""), "Пост.yaml": POST, "Пост.xbsl": POST_TYPE_OPEN,
@@ -276,7 +277,7 @@ def test_admin_fields_reported_once_per_element(tmp_path, monkeypatch, data_dir)
         "Админ.xbsl": ADMIN})
     assert rc == 1
     assert len(found) == 1
-    assert "поля Общая, Код видны только администратору" in found[0]["message"]
+    assert "поля Общая, Код ограничены в интерфейсе" in found[0]["message"]
 
 
 @pytest.mark.parametrize("described", [
@@ -332,3 +333,60 @@ def test_computed_rights_given_by_variable_are_open(tmp_path, monkeypatch, data_
         "Пост.xbsl": POST_TYPE_RIGHTS_VARIABLE, "Админ.xbsl": ADMIN})
     assert rc == 1
     assert [(f["rule"], f["line"]) for f in found] == [("ПР-02", 11)]
+
+def test_vendor_democrm_matches_review(tmp_path, monkeypatch, data_dir):
+    vendor = os.environ.get("XBSL_VENDOR_DEMO")
+    if not vendor:
+        pytest.skip("Укажите XBSL_VENDOR_DEMO для сверки с исходниками вендора")
+    source = Path(vendor).resolve() / "DemoCRM"
+    assert source.is_dir()
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "vendor.json"
+    cli.main(["check", str(source), "--data-dir", str(data_dir), "--rules", "ПР-02", "--json", str(output)])
+    findings = json.loads(output.read_text(encoding="utf-8"))["findings"]
+    assert [(Path(f["path"]).name, f["line"]) for f in findings] == [
+        ("СотрудникиФормаОбъекта.yaml", 35),
+    ]
+
+@pytest.mark.parametrize(("condition", "found"), [
+    ("Редактирование.ЕстьПраво()", True),
+    ("Проверки.Можно()", True),
+    ("не Редактирование.ЕстьПраво()", False),
+    ("Редактирование.ЕстьПраво() или ЕстьКоманды", False),
+    ("АдминистраторПанели", False),
+])
+def test_interface_action_right(tmp_path, monkeypatch, data_dir, condition, found):
+    _, findings = check(tmp_path, monkeypatch, data_dir, {
+        "СписокКоманд.yaml": LIST_YAML.replace("ДанныеПользователя.Администратор", condition),
+        "СписокКоманд.xbsl": LIST_XBSL.format(проверка="исп КонтекстДоступа.Привилегированный()"),
+        "Редактирование.yaml": "ВидЭлемента: ПравоНаДействие\nИмя: Редактирование\n",
+        "Проверки.xbsl": """
+            метод Можно(): Булево
+                возврат Определить()
+            ;
+            метод Определить(): Булево
+                возврат Редактирование.ЕстьПраво()
+            ;
+        """,
+    })
+    assert bool(findings) is found
+
+def test_action_right_is_enforced_on_server(tmp_path, monkeypatch, data_dir):
+    _, findings = check(tmp_path, monkeypatch, data_dir, {
+        "СписокКоманд.yaml": LIST_YAML.replace(
+            "ДанныеПользователя.Администратор", "Редактирование.ЕстьПраво()"),
+        "СписокКоманд.xbsl": LIST_XBSL.format(
+            проверка="Редактирование.Проверить()\n        исп КонтекстДоступа.Привилегированный()"),
+        "Редактирование.yaml": "ВидЭлемента: ПравоНаДействие\nИмя: Редактирование\n",
+    })
+    assert findings == []
+
+def test_form_can_be_nested_below_object_metadata(tmp_path, monkeypatch, data_dir):
+    _, findings = check(tmp_path, monkeypatch, data_dir, {
+        "экраны/вкладки/редакторы/ПостФорма.yaml": FORM_YAML,
+        "Пост.Объект.xbsl": OBJECT.format(проверка=""),
+        "Пост.yaml": POST,
+        "Пост.xbsl": POST_TYPE_OPEN,
+        "Админ.xbsl": ADMIN,
+    })
+    assert len(findings) == 1

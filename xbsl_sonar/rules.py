@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -70,7 +71,7 @@ RULES: dict[str, RuleText] = {
     ),
     "ПР-02": RuleText(
         code="ПР-02",
-        name="Действие администратора без проверки на сервере",
+        name="Действие с ограничением доступа без проверки на сервере",
         description=(
             "<p>Элемент формы, который интерфейс показывает только администратору, — права "
             "проверены одной видимостью. Видимость решает клиент: данные формы и вызовы "
@@ -78,9 +79,9 @@ RULES: dict[str, RuleText] = {
             "Если за таким элементом стоит запись данных без своей проверки на сервере, "
             "сделать её может любой вошедший.</p>"
             "<p><b>Находка:</b> в YAML компонента элемент с <code>Видимость</code> или "
-            "<code>Доступность</code>, выражение которых говорит об администраторе "
-            "(<code>=ДанныеПользователя.Администратор</code>, <code>=Администратор</code>, "
-            "<code>ЭтоАдминистратор()</code>), и внутри него:</p><ul>"
+            "<code>Доступность</code>, выражение которых проверяет платформенное право на действие напрямую или "
+            "через метод, возвращающий результат проверки. Поддерживается также платформенный "
+            "признак администратора. Внутри элемента проверяется:</p><ul>"
             "<li>обработчик (<code>ПриНажатии</code>, <code>ПриИзменении</code>, "
             "<code>Обработчик</code>…), который сам или через методы модуля формы вызывает "
             "метод <code>@НаСервере @ДоступноСКлиента</code>, который пишет данные "
@@ -94,8 +95,8 @@ RULES: dict[str, RuleText] = {
             "с текущим пользователем: объект пишется стандартной командой формы, и значение "
             "приходит из данных формы.</li></ul>"
             "<p>Сверка — как в ПР-01: вызов метода, читающего текущего пользователя (набор "
-            "собирается по проверяемому коду и замыкается по вызовам: <code>ЭтоАдминистратор()</code>, "
-            "<code>ПроверитьПрава()</code>…), или <code>КонтрольДоступа.ПроверитьПраво</code>/"
+            "собирается по телам методов и цепочкам вызовов), "
+            "или <code>КонтрольДоступа.ПроверитьПраво</code>/"
             "<code>ЕстьПраво</code>.</p>"
             "<p><b>Не находка:</b> серверный метод, который сам или через вызываемые проверяет "
             "права; элемент, видимый не только администратору; поле, чей реквизит сверяется "
@@ -2010,8 +2011,31 @@ def redraw_data_access(source: SourceFile) -> Iterable[Diagnostic]:
 
 
 # ПР-02: элемент, видимый только администратору, а за ним — запись данных без проверки на сервере.
-_ADMIN_SWITCH = re.compile(
-    r"^(\s*)(-\s+)?(Видимость|Доступность|Visible|Enabled):\s*(['\"]?)=(.*Администратор.*?)\4?\s*$")
+INTERFACE_RIGHTS_ENV = "XBSL_SONAR_INTERFACE_RIGHTS"
+INTERFACE_GUARDS_ENV = "XBSL_SONAR_INTERFACE_GUARDS"
+INTERFACE_ROOTS_ENV = "XBSL_SONAR_INTERFACE_ROOTS"
+_ACCESS_SWITCH = re.compile(
+    r"""^(\s*)(-\s+)?(Видимость|Доступность|Visible|Enabled):\s*(['"]?)=\s*(.*?)\4\s*$""")
+_RIGHT_EXPRESSION = re.compile(r"(\w+)\s*\.\s*(?:ЕстьПраво|HasRight)\s*\(\s*\)")
+_GUARD_CALL = re.compile(r"(?:(\w+)\s*\.\s*)?(\w+)\s*\(\s*\)")
+_PLATFORM_ADMIN_FIELDS = {"Администратор", "ДанныеПользователя.Администратор",
+                          "Administrator", "UserData.Administrator"}
+
+
+def interface_right_condition(expression: str, own: str, rights: set[str],
+                              guards: set[str]) -> bool:
+    """Распознать положительное условие права. Не считать дизъюнкцию ограничением."""
+    expression = expression.strip()
+    if expression in _PLATFORM_ADMIN_FIELDS:
+        return True
+    if match := _RIGHT_EXPRESSION.fullmatch(expression):
+        if match[1] in rights:
+            return True
+    if match := _GUARD_CALL.fullmatch(expression):
+        return f"{match[1] or own}.{match[2]}" in guards
+    return False
+
+
 _YAML_HANDLER = re.compile(r"^\s*(?:-\s+)?(При\w+|Обработчик|On\w+|Handler):\s*(\w+)\s*$")
 _YAML_FIELD = re.compile(
     r"^\s*(?:-\s+)?(?:Значение|Value):\s*(['\"]?)=\s*(?:Объект|Запись|Object|Record)\.(\w+)\s*\1\s*$")
@@ -2158,13 +2182,17 @@ def _editable_by_others(yaml_text: str, type_module: str | None = None) -> bool:
 
 
 def _object_module(source: SourceFile) -> tuple[str, str] | None:
-    """Модуль объекта формы (`Тип.Объект.xbsl`, `Тип.НаборЗаписей.xbsl`) рядом с формой
-    или уровнем выше: (имя типа, текст), если объект вправе менять не только администратор
+    """Модуль объекта формы (`Тип.Объект.xbsl`, `Тип.НаборЗаписей.xbsl`) в цепочке каталогов формы до корня анализа: (имя типа, текст), если объект вправе менять не только администратор
     (по `Тип.yaml` там же)."""
     m = _FORM_OF.search(source.text)
     if not m:
         return None
-    for folder in (source.path.parent, source.path.parent.parent):
+    roots = {Path(path) for path in os.environ.get(INTERFACE_ROOTS_ENV, "").split(os.pathsep) if path}
+    folder = source.path.resolve().parent
+    scope = next((parent for parent in (folder, *folder.parents) if parent in roots), folder.parent)
+    for folder in (folder, *folder.parents):
+        if not folder.is_relative_to(scope):
+            break
         for suffix in (".Объект.xbsl", ".НаборЗаписей.xbsl"):
             try:
                 text = (folder / (m.group(1) + suffix)).read_text(encoding="utf-8-sig")
@@ -2191,15 +2219,18 @@ def _field_checked(module: tuple[str, str], field: str, identity: set[str]) -> b
     return False
 
 
-@rule("ПР-02", "Действие администратора без проверки на сервере", "S", severity=Severity.WARNING)
+@rule("ПР-02", "Действие с ограничением доступа без проверки на сервере", "S", severity=Severity.WARNING)
 def admin_only_in_interface(source: SourceFile) -> Iterable[Diagnostic]:
     if source.kind != "yaml" or not _YAML_COMPONENT.search(source.text):
         return []
     lines = source.text.splitlines()
-    switches = [(n, m) for n, line in enumerate(lines) if (m := _ADMIN_SWITCH.match(line))]
+    own = source.path.name.split(".")[0]
+    rights = set(os.environ.get(INTERFACE_RIGHTS_ENV, "").split(",")) - {""}
+    guards = set(os.environ.get(INTERFACE_GUARDS_ENV, "").split(",")) - {""}
+    switches = [(n, m) for n, line in enumerate(lines) if (m := _ACCESS_SWITCH.match(line))
+                and interface_right_condition(m[5], own, rights, guards)]
     if not switches:
         return []
-    own = source.path.name.split(".")[0]
     unguarded = _unguarded_set()
     identity = set(filter(None, os.environ.get(IDENTITY_ENV, "").split(",")))
     pair = _read_pair(source.path, ".xbsl")
@@ -2225,7 +2256,7 @@ def admin_only_in_interface(source: SourceFile) -> Iterable[Diagnostic]:
                     reported.add(k)
                     out.append(Diagnostic(
                         source.rel, k + 1, _indent(lines[k]) + 1, "ПР-02", Severity.WARNING,
-                        f"{key}: элемент виден только администратору, а {h.group(1)} "
+                        f"{key}: интерфейс ограничивает доступ к элементу, а {h.group(1)} "
                         f"{h.group(2)} доходит до '{via}' — метод с доступом с клиента пишет "
                         f"в повышенных правах без проверки текущего пользователя. Видимость решает "
                         f"клиент: проверить права в самом серверном методе.",
@@ -2244,11 +2275,11 @@ def admin_only_in_interface(source: SourceFile) -> Iterable[Diagnostic]:
             out.append(Diagnostic(
                 source.rel, k + 1, _indent(lines[k]) + 1, "ПР-02", Severity.WARNING,
                 f"{key}: {'поле' if len(fields) == 1 else 'поля'} {names} "
-                f"{'видно' if len(fields) == 1 else 'видны'} только администратору, а "
+                f"{'ограничено' if len(fields) == 1 else 'ограничены'} в интерфейсе, а "
                 f"'{module[0]}.ПередЗаписью' не {'сверяет его' if len(fields) == 1 else 'сверяет их'} "
                 f"с текущим пользователем — значение приходит из данных формы с клиента. "
                 f"Проверить в ПередЗаписью, что {'его' if len(fields) == 1 else 'их'} меняет "
-                f"администратор.",
+                f"пользователь с нужным правом.",
             ))
     return out
 

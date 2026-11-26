@@ -24,7 +24,7 @@ import tempfile
 from pathlib import Path
 
 from xbsl_sonar import __version__, data, report
-from xbsl_sonar.rules import (ADMIN_ENV, DATA_ENV, IDENTITY_ENV, UPLOAD_ENV, INCIDENT_SINKS_ENV, MAX_ACCESSES_ENV,
+from xbsl_sonar.rules import (INTERFACE_RIGHTS_ENV, INTERFACE_GUARDS_ENV, INTERFACE_ROOTS_ENV, interface_right_condition, ADMIN_ENV, DATA_ENV, IDENTITY_ENV, UPLOAD_ENV, INCIDENT_SINKS_ENV, MAX_ACCESSES_ENV,
                                UNBOUNDED_ENV, QUERIED_ENV,
                                MIN_PERIOD_ENV, PD_ENTITIES_ENV, PD_JOURNAL_ENV, PD_JOURNALED_ENV,
                                RULE_IDS, RULES, SANITIZERS_ENV, SERVER_ENV, UNGUARDED_ENV)
@@ -164,7 +164,7 @@ def data_methods(paths: list[str]) -> set[str]:
     return _closure(found - cached, bodies, cached)
 
 
-def unguarded_methods(paths: list[str]) -> set[str]:
+def unguarded_methods(paths: list[str], action_rights: set[str] | None = None) -> set[str]:
     """Методы с доступом с клиента, которые работают в повышенных правах без сверки (для ПР-02),
     — `Модуль.Метод`.
 
@@ -179,6 +179,14 @@ def unguarded_methods(paths: list[str]) -> set[str]:
                         if _PRIVILEGED.search(text := "\n".join(lines)) and _WRITE.search(text)}, bodies)
     checked = identity_methods(paths)
     checked |= {k for k, lines in bodies.items() if _RIGHT_CHECK.search("\n".join(lines))}
+    if action_rights:
+        right_check = re.compile(r"(?m)^\s*(\w+)\s*\.\s*(?:Проверить|Check)\s*\(\s*\)\s*$")
+        for key, lines in bodies.items():
+            text = "\n".join(lines)
+            privilege = _PRIVILEGED.search(text)
+            before = text[:privilege.start()] if privilege else text
+            if any(match[1] in action_rights for match in right_check.finditer(before)):
+                checked.add(key)
     checked = _closure(checked, bodies)
     return {k for k in writers - checked
             if annotations.get(k, set()) & _ON_SERVER and annotations[k] & _FROM_CLIENT}
@@ -544,6 +552,33 @@ def queried_words(paths: list[str]) -> set[str]:
     return words
 
 
+_RIGHT_METADATA = re.compile(r"^(?:ВидЭлемента|ElementKind):[ 	]*(?:ПравоНаДействие|ActionRight)[ 	]*$", re.M)
+_RETURN_CONDITION = re.compile(r"(?:возврат|return)[ 	]+([^;\n]+)\s*;?\s*")
+
+
+def interface_access_index(paths: list[str]) -> tuple[set[str], set[str]]:
+    rights: set[str] = set()
+    for path in map(Path, paths):
+        candidates = path.rglob("*.yaml") if path.is_dir() else [path]
+        for candidate in candidates:
+            if candidate.suffix != ".yaml":
+                continue
+            text = candidate.read_text(encoding="utf-8-sig", errors="replace")
+            if _RIGHT_METADATA.search(text) and (name := _YAML_NAME.search(text)):
+                rights.add(name[1])
+    bodies, _ = _bodies(paths, unique_methods=True)
+    guards = admin_methods(paths)
+    conditions = {key: match[1] for key, lines in bodies.items()
+                  if (match := _RETURN_CONDITION.fullmatch("\n".join(lines).strip()))}
+    while True:
+        found = {key for key, condition in conditions.items()
+                 if key not in guards
+                 and interface_right_condition(condition, key.split(".")[0], rights, guards)}
+        if not found:
+            return rights, guards
+        guards.update(found)
+
+
 def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                 sanitizers: str = "", min_period: str = "",
                 server_file: Path | None = None, data_file: Path | None = None,
@@ -552,10 +587,18 @@ def _run_engine(paths: list[str], data_dir: Path, rules: list[str],
                 admin_file: Path | None = None,
                 upload_file: Path | None = None,
                 unbounded_file: Path | None = None,
-                queried_file: Path | None = None) -> list[report.Finding]:
+                queried_file: Path | None = None,
+                access_index: tuple[set[str], set[str]] | None = None) -> list[report.Finding]:
     cmd = [sys.executable, "-m", "xbsl", "--data-dir", str(data_dir), "--lang", "ru",
            "--select", ",".join(rules), "--format", "json", *paths]
-    env = dict(os.environ, **{IDENTITY_ENV: ",".join(sorted(identity_methods(paths))),
+    rights, guards = access_index if access_index is not None else (
+        interface_access_index(paths) if "ПР-02" in rules else (set(), set()))
+    env = dict(os.environ, **{INTERFACE_RIGHTS_ENV: ",".join(sorted(rights)),
+                              INTERFACE_ROOTS_ENV: os.pathsep.join(
+                                  str(path.resolve() if path.is_dir() else path.resolve().parent)
+                                  for path in map(Path, paths)),
+                              INTERFACE_GUARDS_ENV: ",".join(sorted(guards)),
+                              IDENTITY_ENV: ",".join(sorted(identity_methods(paths))),
                               SANITIZERS_ENV: sanitizers,
                               SERVER_ENV: str(server_file or ""),
                               DATA_ENV: str(data_file or ""),
@@ -594,8 +637,9 @@ def _check(args) -> int:
         server_file.write_text("\n".join(sorted(server_methods(args.paths))), encoding="utf-8")
         data_file = Path(tmp) / "data.txt"
         data_file.write_text("\n".join(sorted(data_methods(args.paths))), encoding="utf-8")
+        access_index = interface_access_index(args.paths) if "ПР-02" in rules else (set(), set())
         unguarded_file = Path(tmp) / "unguarded.txt"
-        unguarded_file.write_text("\n".join(sorted(unguarded_methods(args.paths))), encoding="utf-8")
+        unguarded_file.write_text("\n".join(sorted(unguarded_methods(args.paths, access_index[0]))), encoding="utf-8")
         admin_file = Path(tmp) / "admin.txt"
         admin_file.write_text("\n".join(sorted(admin_methods(args.paths))), encoding="utf-8")
         upload_file = Path(tmp) / "upload.txt"
@@ -616,7 +660,7 @@ def _check(args) -> int:
         findings = _run_engine(args.paths, data_dir, rules, args.sanitizers or "",
                                args.min_period or "", server_file, data_file,
                                args.max_accesses or "", unguarded_file, pd, admin_file,
-                               upload_file, unbounded_file, queried_file)
+                               upload_file, unbounded_file, queried_file, access_index)
     report.apply_exceptions(findings, root)
     if args.perimeter:
         report.apply_perimeter(findings, report.read_perimeter(Path(args.perimeter)))
